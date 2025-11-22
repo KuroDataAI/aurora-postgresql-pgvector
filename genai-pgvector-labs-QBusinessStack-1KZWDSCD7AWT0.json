@@ -1,0 +1,399 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: >
+    Amazon Q Business Stack
+
+Parameters:
+
+  CreateIDC:
+    Type: String
+    Default: "yes"
+    AllowedValues:
+      - "no"
+      - "yes"
+    Description: Whether this stack should create AWS IAM Identity Center instance and setup users/groups. Answer "Yes" only if the AWS account does not have IDC enabled and is allow listed to enable the same.
+
+Conditions:
+  IfCreateIDC: !Equals 
+    - !Ref CreateIDC
+    - "yes"
+
+Resources: 
+
+  IDCInstance:
+    Type: AWS::SSO::Instance
+    Condition: IfCreateIDC
+    Properties:
+      Name: IAMIDC_QLABS
+
+  IDCLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: IfCreateIDC
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SSOAdminPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sso:DescribeInstance
+                  - sso:ListInstances
+                  - iam:CreateServiceLinkedRole
+                  - identitystore:CreateGroup
+                  - identitystore:CreateGroupMembership
+                  - identitystore:CreateUser
+                Resource:
+                  - '*'
+
+  IDCConfLambda:
+    Type: AWS::Lambda::Function
+    Condition: IfCreateIDC
+    Properties:
+      Handler: index.handler
+      Runtime: python3.11
+      Timeout: 300
+      Description: Configures IDC Local Instance
+      Role: !GetAtt IDCLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import boto3
+          import cfnresponse
+
+          sso_client = boto3.client('sso-admin')
+          id_store_client = boto3.client('identitystore')
+
+          GROUPS = [
+              {
+                  "group_name": "Group_CE",
+                  "group_desc": "Group for Clinical Experts"
+              },
+              {
+                  "group_name": "Group_PA",
+                  "group_desc": "Group for Patient Advocates"
+              },
+              {
+                  "group_name": "Group_HIS",
+                  "group_desc": "Group for Information Specialists"
+              }
+          ]
+
+          USERS = [
+              {
+                  "user_name": "jane_doe",
+                  "email": "jane_doe@example.com",
+                  "display_name": "Jane Doe",
+                  "given_name": "Jane",
+                  "last_name": "Doe",
+                  "groups": ["Group_PA"]  
+              },
+              {
+                  "user_name": "john_doe",
+                  "email": "john_doe@example.com",
+                  "display_name": "John Doe",
+                  "given_name": "John",
+                  "last_name": "Doe",
+                  "groups": ["Group_CE"]  
+              },
+              {
+                  "user_name": "mary_major",
+                  "email": "mary_major@example.com",
+                  "display_name": "Mary Major",
+                  "given_name": "Mary",
+                  "last_name": "Major",
+                  "groups": ["Group_HIS"]
+              }
+          ]
+
+          def handler(event, context):
+              try:
+                  print('Received event: ' + json.dumps(event, indent=4, default=str))
+                  if event['RequestType'] == 'Create':
+                      print("Configuring IDC Instance")
+                      list_inst_response = sso_client.list_instances()
+                      if list_inst_response["Instances"]:
+                          print("IDC Instance found...")
+                          instance_arn = list_inst_response["Instances"][0]['InstanceArn']
+                      identity_store_id = None
+                      for idx in range(10):
+                          instance_dsec = sso_client.describe_instance(InstanceArn=instance_arn)
+                          print("IDC Instance:" + json.dumps(instance_dsec, indent=4, default=str))
+                          if instance_dsec['Status'] != "ACTIVE":
+                              time.sleep(10)
+                          else:
+                              identity_store_id = instance_dsec['IdentityStoreId']
+                              break
+                      if identity_store_id:
+                          group_idx = {}
+                          for group in GROUPS:
+                              resp = id_store_client.create_group(
+                                  IdentityStoreId=identity_store_id,
+                                  DisplayName=group["group_name"],
+                                  Description=group["group_desc"]
+                              )
+                              print("Group Creation:" + json.dumps(resp, indent=4, default=str))
+                              group_idx[group["group_name"]] = resp["GroupId"]
+                          for user in USERS:
+                              user_resp = id_store_client.create_user(
+                                  IdentityStoreId=identity_store_id,
+                                  UserName=user["user_name"],
+                                  DisplayName=user["display_name"],
+                                  Emails=[{"Value": user["email"], "Type": "Work", "Primary": True}],
+                                  Name={"GivenName": user["given_name"], "FamilyName": user["last_name"]}
+                              )
+                              print("User Creation:" + json.dumps(user_resp, indent=4, default=str))
+                              # Assign groups
+                              for grp in user["groups"]:
+                                  if grp in group_idx:
+                                      member_resp = id_store_client.create_group_membership(
+                                          IdentityStoreId=identity_store_id,
+                                          GroupId=group_idx[grp],
+                                          MemberId={"UserId": user_resp["UserId"]}
+                                      )
+                                      print("Group Member Creation:" + json.dumps(member_resp, indent=4, default=str))
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {'InstanceArn': instance_arn}, instance_arn)
+                  # elif event['RequestType'] == 'Delete':
+                  #     sso_client.delete_instance(InstanceArn=event['PhysicalResourceId'])
+                  #     cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, event['PhysicalResourceId'])
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  print("done")
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  IDCInstanceConf:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: IfCreateIDC
+    DependsOn: IDCInstance
+    Properties:
+      ServiceToken: !GetAtt IDCConfLambda.Arn
+  
+  APGROSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: "QBusiness-APG-Read-Only"
+      Description: 'This is the secret for a Read only user in the Aurora cluster'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "qbusiness_ro" }'
+        GenerateStringKey: 'password'
+        PasswordLength: 16
+        ExcludePunctuation: true
+
+  WebExperienceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: application.qbusiness.amazonaws.com
+            Action: 
+              - 'sts:AssumeRole'
+              - 'sts:SetContext'
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+              ArnLike:
+                "aws:SourceArn": !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*"
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'qbusiness:Chat'
+                  - 'qbusiness:ChatSync'
+                  - 'qbusiness:ListMessages'
+                  - 'qbusiness:ListConversations'
+                  - 'qbusiness:DeleteConversation'
+                  - 'qbusiness:PutFeedback'
+                  - 'qbusiness:GetWebExperience'
+                  - 'qbusiness:GetApplication'
+                  - 'qbusiness:ListPlugins'
+                  - 'qbusiness:GetChatControlsConfiguration'
+                  - 'qbusiness:ListRetrievers'
+                  - 'qbusiness:GetRetriever'
+                Resource: 
+                  - !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*"
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                Resource: 
+                  - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+              - Effect: Allow
+                Action:
+                  - 'qapps:CreateQApp'
+                  - 'qapps:PredictQApp'
+                  - 'qapps:PredictProblemStatementFromConversation'
+                  - 'qapps:PredictQAppFromProblemStatement'
+                  - 'qapps:CopyQApp'
+                  - 'qapps:GetQApp'
+                  - 'qapps:ListQApps'
+                  - 'qapps:UpdateQApp'
+                  - 'qapps:DeleteQApp'
+                  - 'qapps:AssociateQAppWithUser'
+                  - 'qapps:DisassociateQAppFromUser'
+                  - 'qapps:ImportDocument'
+                  - 'qapps:ImportDocumentToQApp'
+                  - 'qapps:ImportDocumentToQAppSession'
+                  - 'qapps:GetQAppSession'
+                  - 'qapps:GetQAppSessionMetadata'
+                  - 'qapps:UpdateQAppSession'
+                  - 'qapps:UpdateQAppSessionMetadata'
+                  - 'qapps:CreateLibraryItem'
+                  - 'qapps:GetLibraryItem'
+                  - 'qapps:UpdateLibraryItem'
+                  - 'qapps:CreateLibraryItemReview'
+                  - 'qapps:AssociateLibraryItemReview'
+                  - 'qapps:DisassociateLibraryItemReview'
+                  - 'qapps:ListLibraryItems'
+                  - 'qapps:CreateSubscriptionToken'
+                  - 'qapps:StartQAppSession'
+                  - 'qapps:StopQAppSession'
+                Resource: 
+                  - !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*"
+          PolicyName: WebExperiencePolicy
+
+  DataSourceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: 'AllowsAmazonQToAssumeRoleForServicePrincipal'
+            Effect: Allow
+            Principal:
+              Service: 
+                - qbusiness.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+              ArnLike:
+                "aws:SourceArn": !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*"
+      Policies:
+        - PolicyName: DataSourcePolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: AllowsAmazonQToGetS3Objects  
+                Action:
+                  - 's3:GetObject'
+                Resource:
+                  - 'arn:aws:s3:::bucket/*'
+                Effect: Allow
+                Condition:
+                  StringEquals:
+                    'aws:ResourceAccount': !Ref AWS::AccountId
+              - Sid: AllowsAmazonQToGetSecret
+                Effect: Allow
+                Action:
+                  - 'secretsmanager:GetSecretValue'
+                Resource:
+                  - !Ref APGROSecrets
+              - Sid: AllowsAmazonQToDecryptSecret
+                Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                Resource:
+                  - !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*"
+                Condition:
+                  StringLike:
+                    'kms:ViaService':
+                      - 'secretsmanager.*.amazonaws.com'
+              - Sid: AllowsAmazonQToIngestDocuments
+                Effect: Allow
+                Action:
+                  - 'qbusiness:BatchPutDocument'
+                  - 'qbusiness:BatchDeleteDocument'
+                Resource: !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*/index/*"
+              - Sid: AllowsAmazonQToIngestPrincipalMapping
+                Effect: Allow
+                Action:
+                  - 'qbusiness:PutGroup'
+                  - 'qbusiness:CreateUser'
+                  - 'qbusiness:DeleteGroup'
+                  - 'qbusiness:UpdateUser'
+                  - 'qbusiness:ListGroups'
+                Resource:
+                  - !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*"
+                  - !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*/index/*"
+                  - !Sub "arn:aws:qbusiness:${AWS::Region}:${AWS::AccountId}:application/*/index/*/data-source/*"
+              - Sid: AllowsAmazonQToCreateAndDeleteNI
+                Effect: Allow
+                Action:
+                  - 'ec2:CreateNetworkInterface'
+                  - 'ec2:DeleteNetworkInterface'
+                Resource:
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:subnet/*"
+                  - !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:security-group/*"
+              - Sid: AllowsAmazonQToCreateAndDeleteNIForSpecificTag
+                Effect: Allow
+                Action:
+                  - 'ec2:CreateNetworkInterface'
+                  - 'ec2:DeleteNetworkInterface'
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                Condition:
+                  StringLike:
+                    'aws:RequestTag/AMAZON_Q': !Sub "qbusiness_${AWS::AccountId}_*"
+                  'ForAllValues:StringEquals':
+                    'aws:TagKeys':
+                      - AMAZON_Q
+              - Sid: AllowsAmazonQToCreateTags
+                Effect: Allow
+                Action:
+                  - 'ec2:CreateTags'
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                Condition:
+                  StringEquals:
+                    'ec2:CreateAction': CreateNetworkInterface
+              - Sid: AllowsAmazonQToCreateNetworkInterfacePermission
+                Effect: Allow
+                Action:
+                  - 'ec2:CreateNetworkInterfacePermission'
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*"
+                Condition:
+                  StringLike:
+                    'aws:ResourceTag/AMAZON_Q': !Sub "qbusiness_${AWS::AccountId}_*"
+              - Sid: AllowsAmazonQToDescribeResourcesForVPC
+                Effect: Allow
+                Action:
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:DescribeAvailabilityZones'
+                  - 'ec2:DescribeNetworkInterfaceAttribute'
+                  - 'ec2:DescribeVpcs'
+                  - 'ec2:DescribeRegions'
+                  - 'ec2:DescribeNetworkInterfacePermissions'
+                  - 'ec2:DescribeSubnets'
+                Resource: '*'
+
+Outputs:
+
+  IDCInstanceArn:
+    Condition: IfCreateIDC
+    Description: AWS IAM Identity Center instance Arn
+    Value: !GetAtt IDCInstance.InstanceArn
+  
+  WebExperienceRole:
+    Description: The WebExperienceRole Arn
+    Value: !GetAtt WebExperienceRole.Arn
+
+  DataSourceRole:
+    Description: The DataSourceRole Arn
+    Value: !GetAtt DataSourceRole.Arn

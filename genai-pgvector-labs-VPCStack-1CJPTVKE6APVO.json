@@ -1,0 +1,274 @@
+Parameters:
+
+  TemplateName:
+    Type: String
+    Default: genai-idr-labs
+    Description: Name used for different elements created.
+
+  VpcName:
+    Default: APGPGVectorWorkshop
+    Type: String
+
+  VpcCIDR:
+    Default: 10.0.0.0/16
+    Type: String
+
+  PublicSubnetACidr:
+    Default: 10.0.0.0/24
+    Type: String
+
+  PublicSubnetBCidr:
+    Default: 10.0.1.0/24
+    Type: String
+
+  PublicSubnetCCidr: 
+    Default: 10.0.2.0/24
+    Type: String
+
+  PrivateSubnetACidr: 
+    Default: 10.0.10.0/24
+    Type: String
+
+  PrivateSubnetBCidr: 
+    Default: 10.0.11.0/24
+    Type: String
+
+  PrivateSubnetCCidr: 
+    Default: 10.0.12.0/24
+    Type: String
+
+Resources:
+
+  MainVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      InstanceTenancy: default
+      CidrBlock: !Ref VpcCIDR
+      Tags:
+        - Key: Name
+          Value:  !Ref VpcName
+
+## Create an IGW & attach it to the VPC
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    DependsOn: MainVPC
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${TemplateName}-igw
+  attachIGW:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MainVPC
+      InternetGatewayId: !Ref InternetGateway
+
+# Now some subnets, 2 public and 2 private:
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PublicSubnetACidr
+      AvailabilityZone: !Select [ 0, !GetAZs ]    # Get the first AZ in the list
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: !Sub ${TemplateName}-PublicA
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PublicSubnetBCidr
+      AvailabilityZone: !Select [ 1, !GetAZs ]    # Get the second AZ in the list
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: !Sub ${TemplateName}-PublicB
+  PublicSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PublicSubnetCCidr
+      AvailabilityZone: !Select [ 2, !GetAZs ]    # Get the second AZ in the list
+      MapPublicIpOnLaunch: true
+      Tags:
+      - Key: Name
+        Value: !Sub ${TemplateName}-PublicC        
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PrivateSubnetACidr
+      AvailabilityZone: !Select [ 0, !GetAZs ]    # Get the first AZ in the list
+      Tags:
+      - Key: Name
+        Value: !Sub ${TemplateName}-PrivateA
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PrivateSubnetBCidr
+      AvailabilityZone: !Select [ 1, !GetAZs ]    # Get the second AZ in the list
+      Tags:
+      - Key: Name
+        Value: !Sub ${TemplateName}-PrivateB
+  PrivateSubnetC:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MainVPC
+      CidrBlock: !Ref PrivateSubnetCCidr
+      AvailabilityZone: !Select [ 2, !GetAZs ]    # Get the second AZ in the list
+      Tags:
+      - Key: Name
+        Value: !Sub ${TemplateName}-PrivateC
+
+# Some route tables for our subnets:
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MainVPC
+      Tags:
+      - Key: Name
+        Value: !Sub ${TemplateName}-public-rtb
+  PublicRouteToIGW:   # Public route table has direct routing to IGW:
+    Type: AWS::EC2::Route
+    DependsOn: attachIGW
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Here is a private route table:
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MainVPC
+      Tags:
+      - Key: Name
+        Value: !Sub ${TemplateName}-private-rtb
+  PrivateRoute1:            # Private route table can access web via NAT (created below)
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      # Route traffic through the NAT Gateway:
+      NatGatewayId: !Ref NATGateway
+
+# Attach the public subnets to public route tables,
+  # and attach the private subnets to private route tables:
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetCRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetC
+      RouteTableId: !Ref PublicRouteTable      
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+  PrivateSubnetCRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetC
+      RouteTableId: !Ref PrivateRouteTable
+
+  # A NAT Gateway:
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIPAddress.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+      - Key: Name
+        Value: !Sub ${TemplateName}-NATGW
+
+  ElasticIPAddress:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Gateway
+      VpcId: !Ref MainVPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: '*'
+            Resource: '*'
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+## Outputs
+Outputs:
+  VPC:
+    Description: RDS PostgreSQL Lab VPC
+    Value: !Ref MainVPC
+    Export:
+      Name: !Sub "${AWS::Region}-${AWS::StackName}-MainVPC"
+  PublicSubnetA:
+    Description: PublicSubnetA for LAB
+    Value: !Ref PublicSubnetA
+    Export:
+      Name: !Sub "${AWS::Region}-${AWS::StackName}-PublicSubnetA"
+  PublicSubnetB:
+    Description: PublicSubnetB for LAB
+    Value: !Ref PublicSubnetB
+    Export:
+      Name: !Sub "${AWS::Region}-${AWS::StackName}-PublicSubnetB"
+  PublicSubnetC:
+    Description: PublicSubnetC for LAB
+    Value: !Ref PublicSubnetC
+    Export:
+      Name: !Sub "${AWS::Region}-${AWS::StackName}-PublicSubnetC"        
+  PrivateSubnetA:
+    Description: PrivateSubnetA for LAB
+    Value: !Ref PrivateSubnetA
+    Export:
+      Name: !Sub "${AWS::Region}-${AWS::StackName}-PrivateSubnetA"
+  PrivateSubnetB:
+    Description: PrivateSubnetB for LAB
+    Value: !Ref PrivateSubnetB
+    Export:
+      Name: !Sub "${AWS::Region}-${AWS::StackName}-PrivateSubnetB"
+  PrivateSubnetC:
+    Description: PrivateSubnetC for LAB
+    Value: !Ref PrivateSubnetC
+    Export:
+      Name: !Sub "${AWS::Region}-${AWS::StackName}-PrivateSubnetC"        
+  PrivateSubnets:
+    Description: 'VPCs Subnets private.'
+    Value: !Join [',', [!Ref PrivateSubnetA, !Ref PrivateSubnetB, !Ref PrivateSubnetC]]
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetsPrivate'
+  PublicSubnets:
+    Description: 'VPCs Subnets private.'
+    Value: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB, !Ref PublicSubnetC]]
+    Export:
+      Name: !Sub '${AWS::StackName}-SubnetsPublic'
+  PrivateRouteTable:
+    Description: Private Route Table
+    Value: !Ref PrivateRouteTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateRouteTable'

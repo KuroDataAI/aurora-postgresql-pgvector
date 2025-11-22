@@ -1,0 +1,103 @@
+Resources: 
+# Custom lambda function to get the latest RDS version
+
+  RDSVersionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+      Policies:
+        - PolicyName: LambdaRDSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBEngineVersions
+                Resource: '*'
+      Description: IAM role to provide needed permission for Lambda function to identify the RDS version
+
+  RDSVersionLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-RDSVersion'
+      Description: Run SQL Scripts on Aurora PostgreSQL Database using AWS Lambda function
+      Handler: index.lambda_handler
+      Role: !GetAtt RDSVersionLambdaRole.Arn
+      Runtime: python3.11
+      MemorySize: 2048
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import os
+          import boto3
+
+          def getEngineMinorVersion(engine, engineMajorVersion):
+            rdsclient = boto3.client('rds')
+            response = rdsclient.describe_db_engine_versions(
+                Engine=engine,
+                EngineVersion=engineMajorVersion
+              )
+            return response 
+
+          def lambda_handler(event, context):
+              print (event)
+              print (context)
+              responseData = {}
+
+              if event['RequestType'] == 'Delete':
+                responseData = {'Message': 'SUCCESSFUL'}
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+                return
+
+              try:
+                engineVersion = None
+                engine = event['ResourceProperties']['Engine']
+                engineMajorVersion = event['ResourceProperties']['EngineMajorVersion']
+                
+                for loop in [1,2,3]:
+                
+                  response = getEngineMinorVersion(engine, engineMajorVersion)
+
+                  if len(response['DBEngineVersions']) != 0:
+                    engineList = []
+                    if engine == "aurora-postgresql":
+                      for engines in response['DBEngineVersions']:
+                        if not engines['SupportsLimitlessDatabase']:
+                          engineList.append(engines)
+                    else:
+                      engineList = response['DBEngineVersions']
+
+                    engineVersion = engineList[-1]['EngineVersion']
+                    responseData = {'EngineVersion': engineVersion}
+                    print(responseData)
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+                    break
+                  else:
+                    print(f"No data available for the engine major version {engineMajorVersion}")
+                    engineMajorVersion = str(int(engineMajorVersion) + 1)
+                    print(f"Trying with the next version {engineMajorVersion}")
+                    
+                if engineVersion is None:
+                  print(f'No data available for the engine major version {engineMajorVersion}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData, "CustomResourcePhysicalID")
+
+              except Exception as e:
+                print('Exception: ' + str(e))
+                cfnresponse.send(event, context, cfnresponse.FAILED, responseData, "CustomResourcePhysicalID")
+
+Outputs:
+  RDSVersionLambdaFunction:
+    Description: Custom lambda function Arn to get the minor version 
+    Value: !GetAtt RDSVersionLambdaFunction.Arn
+    Export:
+      Name: !Sub "${AWS::Region}-${AWS::StackName}-RDSVersionLambdaFunction"            

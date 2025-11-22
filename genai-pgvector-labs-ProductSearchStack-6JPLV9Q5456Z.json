@@ -1,0 +1,1150 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: >
+  This template sets up a complete environment for running machine learning workloads with SageMaker, storing data in Aurora PostgreSQL, and utilizing Amazon Bedrock for Gen AI capabilities. It includes necessary networking, security, and IAM configurations to ensure proper functionality and security of the deployed resources.
+
+Parameters:
+  TemplateName:
+    Type: String
+    Description: Name used for different elements created.
+
+  AssetsBucketName:
+    Type: String
+    Description: Workshop studio magic variable AssetsBucketName
+
+  AssetsBucketPrefix:
+    Type: String
+    Description: Workshop studio magic variable AssetsBucketPrefix
+
+  RDSSecrets:
+    Type: String
+
+  VPC: 
+    Type: String
+
+  PrivateSubnets:
+    Type: String
+
+  PrivateRouteTable:
+    Type: String
+
+  DBCluster:
+    Type: String
+
+  APGClusterEP:
+    Type: String
+
+Resources:
+  
+  # Start Bootstrap Aurora PostgreSQL -----------------------------------
+  PsycopgLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: psycopg-layer
+      Description: Psycopg layer with binary and pool extensions
+      Content:
+        S3Bucket: !Ref AssetsBucketName
+        S3Key: !Sub "${AssetsBucketPrefix}psycopg-layer.zip"
+      CompatibleRuntimes:
+        - python3.11
+
+  LambdaBootstrapRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+        - "arn:aws:iam::aws:policy/AmazonSageMakerFullAccess"
+        - "arn:aws:iam::aws:policy/SecretsManagerReadWrite"
+      Policies:
+        - PolicyName: LambdaRDSAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds-data:ExecuteStatement
+                  - secretsmanager:GetSecretValue
+                  - "cloudformation:SignalResource"
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+      Description: IAM role to provide needed permission for Lambda function to Bootstrap Aurora PostgreSQL
+
+  LambdaLG:
+    Type: AWS::Logs::LogGroup
+    DependsOn: LambdaBootstrapFunction
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/BootstrapAurora-${TemplateName}"
+      RetentionInDays: 7
+
+  # IAM Role for the Lambda function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+  LambdaBootstrapFunction:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn: 
+      - rSG
+    Properties:
+      Description: Run SQL Scripts on Aurora PostgreSQL Database using AWS Lambda function
+      Layers:
+        - !Ref PsycopgLayer
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaBootstrapRole.Arn
+      Runtime: python3.11
+      MemorySize: 2048
+      Timeout: 900
+      Environment:
+        Variables:
+          DBSECRET: !Ref RDSSecrets
+      Code:
+        ZipFile: |
+          import asyncio
+          import psycopg
+          import os
+          import boto3
+          import json
+          import logging
+          import cfnresponse
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          async def create_schema_and_table(event, context):
+              logger.info('Starting create_schema_and_table')
+              
+              try:
+                  client = boto3.client('secretsmanager', region_name='us-west-2')
+                  secret_name = os.environ.get('DBSECRET')
+                  secret_value = client.get_secret_value(SecretId=secret_name)
+                  secret = json.loads(secret_value['SecretString'])
+                  uname = secret['username']
+                  userpwd = secret['password']
+                  dbname = secret.get('dbname', 'postgres')
+                  port = secret.get('port', 5432)
+                  endpoint = secret['host']
+                  
+                  async with await psycopg.AsyncConnection.connect(f"host={endpoint} dbname={dbname} user={uname} password={userpwd} port={port} connect_timeout=30") as aconn:
+                      async with aconn.cursor() as acur:
+                          await acur.execute("CREATE SCHEMA IF NOT EXISTS bedrock_integration;")
+                          await acur.execute("SELECT * FROM pg_extension WHERE extname = 'vector';")
+                          result = await acur.fetchone()
+                          if not result:
+                            await acur.execute("CREATE EXTENSION vector;")
+                          else:
+                            logger.info("Vector extension already exists, skipping creation")
+                          await acur.execute("""
+                          CREATE TABLE IF NOT EXISTS bedrock_integration.bedrock_kb (
+                          id uuid PRIMARY KEY,
+                          embedding vector(1024),
+                          chunks text,
+                          metadata json
+                          );
+                          """)
+
+                          await acur.execute("""
+                          CREATE INDEX IF NOT EXISTS bedrock_kb_embedding_idx ON bedrock_integration.bedrock_kb USING hnsw (embedding vector_cosine_ops) WITH (ef_construction=64);
+                          """)
+                          await acur.execute("""
+                          CREATE INDEX IF NOT EXISTS bedrock_kb_chunks_idx ON bedrock_integration.bedrock_kb USING gin (to_tsvector('simple', chunks));
+                          """)
+                          await aconn.commit()
+                  
+                  logger.info('bedrock_integration schema and bedrock_kb table created successfully')
+              except Exception as e:
+                  logger.error('Error creating schema and table')
+                  print('Exception: ' + str(e))
+          
+          def lambda_handler(event, context):
+              logger.info('Starting lambda_handler')
+              print(event)
+              print(context)
+    
+              try:
+                  request_type = event.get('RequestType')
+
+                  if request_type == 'Create':
+                      logger.info('Handling Create request')
+                      asyncio.get_event_loop().run_until_complete(create_schema_and_table(event, context))
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": "Schema and table created successfully"})
+                  elif request_type == 'Update':
+                      logger.info('Handling Update request')
+                      # Implement update logic if needed
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": "Update completed"})
+                  elif request_type == 'Delete':
+                      logger.info('Handling Delete request')
+                      # No action needed for delete, just send a success response
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": "Delete completed"})
+                  else:
+                      logger.error(f"Invalid request type: {request_type}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": f"Invalid request type: {request_type}"})
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt rSG.GroupId
+        SubnetIds: !Split [',', !Ref PrivateSubnets]
+
+  CustomResource:
+    Type: Custom::DBBootstrap
+    DeletionPolicy: Retain
+    DependsOn:
+      - LambdaBootstrapFunction
+    Properties:
+      ServiceToken: !GetAtt LambdaBootstrapFunction.Arn
+
+  rSG:
+    Type: "AWS::EC2::SecurityGroup"
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      GroupDescription: Security group for Lambda which will execute the post database creation steps
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic by default
+          IpProtocol: "-1"
+      VpcId: !Ref VPC
+
+  # End Bootstrap Aurora PostgreSQL -------------------------------------
+  DBInitializationCheckFunction:
+    Type: AWS::Lambda::Function
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn:
+      - LambdaBootstrapFunction
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaBootstrapRole.Arn
+      Layers:
+        - !Ref PsycopgLayer
+      Runtime: python3.11
+      Timeout: 900
+      MemorySize: 2048
+      Environment:
+        Variables:
+          DBSECRET: !Ref RDSSecrets
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt rSG.GroupId
+        SubnetIds: !Split [',', !Ref PrivateSubnets]
+      Code:
+        ZipFile: |
+          import asyncio
+          import boto3
+          import time
+          import psycopg
+          import logging
+          import cfnresponse
+          import json
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          async def initialize_database(secret_dict):
+              host = secret_dict['host']
+              user = secret_dict['username']
+              password = secret_dict['password']
+              dbname = secret_dict.get('dbname', 'postgres')
+
+              max_attempts = 30
+              for attempt in range(max_attempts):
+                  try:
+                      async with await psycopg.AsyncConnection.connect(
+                          host=host,
+                          user=user,
+                          password=password,
+                          dbname=dbname,
+                          connect_timeout=10
+                      ) as aconn:
+                          async with aconn.cursor() as acur:
+                              # Create schema, extension, table, and index
+                              await acur.execute("CREATE SCHEMA IF NOT EXISTS bedrock_integration;")
+                              await acur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                              await acur.execute("""
+                              CREATE TABLE IF NOT EXISTS bedrock_integration.bedrock_kb (
+                              id uuid PRIMARY KEY,
+                              embedding vector(1024),
+                              chunks text,
+                              metadata json
+                              );
+                              """)
+                              await acur.execute("""
+                              CREATE INDEX IF NOT EXISTS bedrock_kb_embedding_idx 
+                              ON bedrock_integration.bedrock_kb 
+                              USING hnsw (embedding vector_cosine_ops) 
+                              WITH (ef_construction=64);
+                              """)
+                              await acur.execute("""
+                              CREATE INDEX IF NOT EXISTS bedrock_kb_chunks_idx
+                              ON bedrock_integration.bedrock_kb 
+                              USING gin (to_tsvector('simple', chunks));
+                              """)
+                              await aconn.commit()
+
+                              # Verify table exists and is accessible
+                              await acur.execute("SELECT COUNT(*) FROM bedrock_integration.bedrock_kb")
+                              count = await acur.fetchone()
+                              logger.info(f"bedrock_integration.bedrock_kb table exists and contains {count[0]} rows")
+                              return True
+                  except psycopg.Error as e:
+                      logger.warning(f"Attempt {attempt + 1}/{max_attempts} failed: {str(e)}")
+                      if attempt < max_attempts - 1:
+                          await asyncio.sleep(10)
+                      else:
+                          logger.error("Max attempts reached. Unable to initialize database.")
+                          return False
+
+          def lambda_handler(event, context):
+              logger.info('Starting lambda_handler')
+              logger.info(f"Received event: {event}")
+
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      secret_name = event['ResourceProperties']['DBSecret']
+                      secret_client = boto3.client('secretsmanager')
+                      secret = secret_client.get_secret_value(SecretId=secret_name)
+                      secret_dict = json.loads(secret['SecretString'])
+
+                      success = asyncio.get_event_loop().run_until_complete(initialize_database(secret_dict))
+                      if success:
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": "Database initialization completed successfully"})
+                      else:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {"Message": "Database initialization failed"})
+                  elif event['RequestType'] == 'Delete':
+                      # No action needed on delete
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": "No action needed for Delete"})
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {"Message": f"Unsupported request type: {event['RequestType']}"})
+              except Exception as e:
+                  logger.error(f"Error in lambda_handler: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Message": f"Error: {str(e)}"})
+  
+  DBInitializationCheck:
+    Type: Custom::DBInitializationCheck
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn:
+      - CustomResource
+      - DBInitializationCheckFunction
+    Properties:
+      ServiceToken: !GetAtt DBInitializationCheckFunction.Arn
+      DBSecret: !Ref RDSSecrets
+
+  DBInitializationCheckRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DBInitializationCheckPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - rds:DescribeDBClusters
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - ec2:CreateNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DeleteNetworkInterface
+                Resource: "*"
+
+
+  # Creating bucket for loading Knowledge Base for Bedrock
+  BedrockKB:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "knowledgebase-${AWS::AccountId}"
+
+
+  # Bedrock Agent
+
+  BedrockPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: 
+              - "bedrock:InvokeModel"
+              - "bedrock:ListCustomModels"
+              - "bedrock:ListFoundationModels"
+              - "bedrock:GetFoundationModel"
+            Resource: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:*"
+          - Effect: Allow
+            Action:
+              - "secretsmanager:GetSecretValue"
+              - "secretsmanager:DescribeSecret"
+            Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:*"
+
+  AmazonBedrockExecutionRoleForAgents:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AWSLambda_FullAccess
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+        - arn:aws:iam::aws:policy/AmazonRDSFullAccess
+        - arn:aws:iam::aws:policy/AmazonRDSDataFullAccess
+        - !Ref BedrockPolicy
+
+  LambdaBasicExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:ListBucket"
+                  - "s3:DeleteObject"
+                Resource:
+                  - !Sub "arn:aws:s3:::${BedrockKB}"
+                  - !Sub "arn:aws:s3:::${BedrockKB}/*"
+        - PolicyName: AWSLambdaBasicExecutionRole
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+
+  BedrockAgentActionLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - DBInitializationCheckFunction
+    Properties:
+      Handler: index.lambda_handler
+      Description: "Contains API calls for DAT301 for Bedrock Agent"
+      Layers:
+        - !Ref PsycopgLayer
+      Timeout: 600
+      Role: !GetAtt "LambdaBasicExecutionRole.Arn"
+      Runtime: python3.11
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref rSG  
+        SubnetIds: !Split [',', !Ref PrivateSubnets]
+      Environment:
+        Variables:
+          DB_HOST: !Ref APGClusterEP
+          DB_NAME: postgres
+          DB_USER:
+            !Join [
+              "",
+              [
+                "{{resolve:secretsmanager:",
+                !Ref RDSSecrets,
+                ":SecretString:username}}",
+              ],
+            ]
+          DB_PASSWORD:
+            !Join [
+              "",
+              [
+                "{{resolve:secretsmanager:",
+                !Ref RDSSecrets,
+                ":SecretString:password}}",
+              ],
+            ]
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import asyncio
+          import psycopg
+          from psycopg.rows import dict_row
+          from decimal import Decimal
+
+          # Database connection parameters
+          DB_HOST = os.environ['DB_HOST']
+          DB_NAME = os.environ['DB_NAME']
+          DB_USER = os.environ['DB_USER']
+          DB_PASSWORD = os.environ['DB_PASSWORD']
+
+          # Custom JSON encoder to handle Decimal
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj)
+                  return super(DecimalEncoder, self).default(obj)
+
+          async def get_products_inventory():
+              async with await psycopg.AsyncConnection.connect(
+                  f"host={DB_HOST} dbname={DB_NAME} user={DB_USER} password={DB_PASSWORD}",
+                  row_factory=dict_row
+              ) as aconn:
+                  async with aconn.cursor() as acur:
+                      await acur.execute("SELECT \"productId\", LEFT(product_description,100), stars, reviews, price, isbestseller, boughtinlastmonth, category_name, quantity FROM bedrock_integration.product_catalog where quantity in (0, 1, 2, 3, 25, 70, 90) ORDER BY \"productId\" LIMIT 20;")
+                      return await acur.fetchall()
+
+          async def get_product_price(productId):
+              async with await psycopg.AsyncConnection.connect(
+                  f"host={DB_HOST} dbname={DB_NAME} user={DB_USER} password={DB_PASSWORD}",
+                  row_factory=dict_row
+              ) as aconn:
+                  async with aconn.cursor() as acur:
+                      await acur.execute(
+                          # TO-DO: Implement the query
+                          # Hint: Return productId, product_description, and price
+                      )
+                      return await acur.fetchone()
+
+          async def restock_product(productId, quantity):
+              async with await psycopg.AsyncConnection.connect(
+                  f"host={DB_HOST} dbname={DB_NAME} user={DB_USER} password={DB_PASSWORD}",
+                  row_factory=dict_row
+              ) as aconn:
+                  async with aconn.cursor() as acur:
+                      try:
+                          # First, check if the product exists
+                          await acur.execute(
+                              "SELECT \"productId\", quantity FROM bedrock_integration.product_catalog WHERE \"productId\" = %s;",
+                              (productId,)
+                          )
+                          product = await acur.fetchone()
+                          
+                          if not product:
+                              return {"status": "Failure", "error": f"Product with ID {productId} not found"}
+                          
+                          # Update the quantity
+                          await acur.execute(
+                              "UPDATE bedrock_integration.product_catalog SET quantity = quantity + %s WHERE \"productId\" = %s RETURNING \"productId\", quantity;",
+                              (quantity, productId)
+                          )
+                          result = await acur.fetchone()
+                          
+                          if result:
+                              await aconn.commit()
+                              return {"status": "Success", "productId": result['productId'], "newQuantity": result['quantity']}
+                          else:
+                              await aconn.rollback()
+                              return {"status": "Failure", "error": "Update operation did not return a result"}
+                      except Exception as e:
+                          await aconn.rollback()
+                          print(f"Error restocking product: {str(e)}")
+                          return {"status": "Failure", "error": str(e)}
+
+          async def async_handler(event, context):
+              print("Received event: " + json.dumps(event))
+              
+              # Use get() method with a default value to avoid KeyError
+              api_path = event.get('apiPath', '/UnknownPath')
+              
+              if api_path == "/GetProductsInventory":
+                  try:
+                      response_data = await get_products_inventory()
+                  except Exception as e:
+                      print(f"Error querying database: {str(e)}")
+                      response_data = {"error": "Failed to retrieve product inventory"}
+              
+              elif api_path == "/GetProductPrice":
+                  print(f"Processing GetProductPrice request. Full event: {json.dumps(event)}")
+                  try:
+                      productId = None
+                      if event.get('queryStringParameters'):
+                          productId = event['queryStringParameters'].get('productId')
+                      if not productId and event.get('body'):
+                          body = json.loads(event['body'])
+                          productId = body.get('productId')
+                              
+                      print(f"Extracted productId: {productId}")
+                              
+                      if not productId:
+                          print("productId not found in request")
+                          response_data = {"error": "Missing productId parameter"}
+                      else:
+                          response_data = await get_product_price(productId)
+                          print(f"get_product_price result: {json.dumps(response_data, cls=DecimalEncoder)}")
+                  except json.JSONDecodeError as je:
+                      print(f"JSON Decode Error: {str(je)}")
+                      response_data = {"error": "Invalid request format"}
+                  except Exception as e:
+                      print(f"Error processing GetProductPrice request: {str(e)}")
+                      response_data = {"error": "Failed to retrieve product price"}
+                      
+              elif api_path == "/RestockProduct":
+                  print(f"Processing RestockProduct request. Full event: {json.dumps(event)}")
+                  try:
+                      # Extract parameters from requestBody
+                      request_body = event.get('requestBody', {})
+                      content = request_body.get('content', {})
+                      json_content = content.get('application/json', {})
+                      properties = json_content.get('properties', [])
+                  
+                      print(f"Properties: {properties}")
+                  
+                      # Convert the list of dictionaries to a single dictionary
+                      params = {item['name']: item['value'] for item in properties if 'name' in item and 'value' in item}
+                  
+                      print(f"Extracted params: {params}")
+                  
+                      # Get productId and quantity
+                      productId = params.get('productId')
+                      quantity = params.get('quantity')
+                  
+                      print(f"Extracted parameters: productId={productId}, quantity={quantity}")
+                  
+                      if not productId:
+                          raise ValueError("Missing productId parameter")
+                      if quantity is None:
+                          raise ValueError("Missing quantity parameter")
+                  
+                      try:
+                          quantity = int(quantity)
+                      except ValueError:
+                          raise ValueError(f"Invalid quantity: '{quantity}' is not an integer")
+                  
+                      if quantity <= 0:
+                          raise ValueError("Quantity must be a positive integer")
+                  
+                      response_data = await restock_product(productId, quantity)
+                      print(f"restock_product result: {json.dumps(response_data, cls=DecimalEncoder)}")
+                  except ValueError as ve:
+                      print(f"Validation error: {str(ve)}")
+                      response_data = {"error": str(ve)}
+                  except Exception as e:
+                      print(f"Error processing RestockProduct request: {str(e)}")
+                      response_data = {"error": f"Failed to restock product: {str(e)}"}
+              else:
+                  response_data = {"message": f"Unknown API Path: {api_path}"}
+
+              response_body = {
+                  'application/json': {
+                      'body': json.dumps(response_data, cls=DecimalEncoder)
+                  }
+              }
+              
+              action_response = {
+                  'actionGroup': event.get('actionGroup', 'UnknownActionGroup'),
+                  'apiPath': api_path,
+                  'httpMethod': event.get('httpMethod', 'GET'),
+                  'httpStatusCode': 200,
+                  'responseBody': response_body
+              }
+              
+              session_attributes = event.get('sessionAttributes', {})
+              prompt_session_attributes = event.get('promptSessionAttributes', {})
+              
+              api_response = {
+                  'messageVersion': '1.0', 
+                  'response': action_response,
+                  'sessionAttributes': session_attributes,
+                  'promptSessionAttributes': prompt_session_attributes
+              }
+              
+              print("Returning API response: " + json.dumps(api_response, cls=DecimalEncoder))
+                  
+              return api_response
+
+          def lambda_handler(event, context):
+              return asyncio.get_event_loop().run_until_complete(async_handler(event, context))
+
+  # Add resource-based policy for Bedrock Agent Lambda
+  BedrockAgentLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BedrockAgentActionLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "bedrock.amazonaws.com"
+      SourceArn: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:agent/*"
+
+  AmazonBedrockAgentKnowledgebase:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn:
+      - DBInitializationCheck
+    Properties:
+      Description: Bedrock Agent Knowledgebase for DAT301
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+          EmbeddingModelConfiguration:
+            BedrockEmbeddingModelConfiguration:
+              Dimensions: 1024
+      Name: !Sub "${TemplateName}-agent-kb"
+      RoleArn: !GetAtt AmazonBedrockExecutionRoleForAgents.Arn
+      StorageConfiguration:
+        Type: RDS
+        RdsConfiguration:
+          ResourceArn: !Sub "arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DBCluster}"
+          CredentialsSecretArn: !Ref RDSSecrets
+          DatabaseName: "postgres"
+          TableName: "bedrock_integration.bedrock_kb"
+          FieldMapping:
+            MetadataField: "metadata"
+            PrimaryKeyField: "id"
+            TextField: "chunks"
+            VectorField: "embedding"
+
+  AmazonBedrockAgentDatasource:
+    Type: AWS::Bedrock::DataSource
+    DependsOn:
+      - AmazonBedrockAgentKnowledgebase
+    Properties:
+      DataDeletionPolicy: DELETE
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt BedrockKB.Arn
+          BucketOwnerAccountId: !Sub "${AWS::AccountId}"
+      Description: "Datasource for Bedrock Agent"
+      KnowledgeBaseId: !GetAtt AmazonBedrockAgentKnowledgebase.KnowledgeBaseId
+      Name: !Sub "bedrock-ds-${TemplateName}"
+
+  AmazonBedrockAgent:
+    Type: AWS::Bedrock::Agent
+    DependsOn:
+      - AmazonBedrockAgentDatasource
+      - BedrockAgentActionLambda
+    Properties:
+      AgentName: !Sub "${TemplateName}-agent"
+      ActionGroups:
+        - ActionGroupName: !Sub "${TemplateName}-agent"
+          Description: "DAT-301-Agent"
+          ActionGroupExecutor:
+            Lambda: !GetAtt BedrockAgentActionLambda.Arn
+          ApiSchema:
+            Payload: | 
+              ---
+              openapi: 3.0.0
+              info:
+                title: Blaize Bazaar
+                version: 1.0.0
+                description: APIs for managing product inventory
+              paths:
+                "/GetProductsInventory":
+                  get:
+                    summary: Gets products inventory
+                    description: Gets all product inventory, limited to 20 items
+                    operationId: getProductsInventory
+                    parameters: []
+                    responses:
+                      '200':
+                        description: Returns inventory of all products (limited to 20)
+                        content:
+                          application/json:
+                            schema:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  productId:
+                                    type: string
+                                    description: Product Id
+                                  product_description:
+                                    type: string
+                                    description: Product Description
+                                  stars:
+                                    type: number
+                                    format: float
+                                    description: Product Rating
+                                  reviews:
+                                    type: integer
+                                    description: Number of Reviews
+                                  price:
+                                    type: number
+                                    format: float
+                                    description: Product Price
+                                  isbestseller:
+                                    type: boolean
+                                    description: Is Best Seller
+                                  boughtinlastmonth:
+                                    type: integer
+                                    description: Bought in Last Month
+                                  category_name:
+                                    type: string
+                                    description: Category Name
+                                  quantity:
+                                    type: integer
+                                    description: Quantity
+                "/GetProductPrice":
+                  get:
+                    summary: Gets product price
+                    description: Gets the price of a specific product by its ID
+                    operationId: getProductPrice
+                    parameters:
+                    - name: productId
+                      in: query
+                      required: true
+                      schema:
+                        type: string
+                      description: The ID of the product to get the price for
+                    responses:
+                      '200':
+                        description: Returns the product details including price
+                        content:
+                          application/json:
+                            schema:
+                              type: object
+                              properties:
+                                productId:
+                                  type: string
+                                  description: Product Id
+                                product_description:
+                                  type: string
+                                  description: Product Description
+                                price:
+                                  type: number
+                                  format: float
+                                  description: Product Price
+                      '404':
+                        description: Product not found
+                        content:
+                          application/json:
+                            schema:
+                              type: object
+                              properties:
+                                error:
+                                  type: string
+                                  description: Error message
+                "/RestockProduct":
+                  post:
+                    summary: Restocks a product
+                    description: Increases the quantity of a specific product
+                    operationId: RestockProduct
+                    requestBody:
+                      required: true
+                      content:
+                        application/json:
+                          schema:
+                            type: object
+                            required:
+                            - productId
+                            - quantity
+                            properties:
+                              productId:
+                                type: string
+                                description: Product Id
+                              quantity:
+                                type: integer
+                                description: Quantity to add to the current stock
+                    responses:
+                      '200':
+                        description: Returns the status of product restock operation
+                        content:
+                          application/json:
+                            schema:
+                              type: object
+                              properties:
+                                status:
+                                  type: string
+                                  description: Status of the product restock operation - Success
+                                    or Failure
+                                productId:
+                                  type: string
+                                  description: Product Id of the restocked item
+                                newQuantity:
+                                  type: integer
+                                  description: Updated quantity after restocking
+                                error:
+                                  type: string
+                                  description: Error message in case of failure
+                      '400':
+                        description: Bad Request - Missing or invalid parameters
+                        content:
+                          application/json:
+                            schema:
+                              type: object
+                              properties:
+                                error:
+                                  type: string
+                                  description: Error message
+
+      AgentResourceRoleArn: !GetAtt AmazonBedrockExecutionRoleForAgents.Arn
+      Instruction: "You are a knowledgeable shopping assistant with real-time access to Blaize Bazaar?s inventory data. Guide customers confidently through our product selection, maintaining accurate stock information and providing tailored recommendations. When inventory is low, proactively suggest suitable alternatives based on customer preferences and available stock. Ask targeted questions to understand customer needs and provide personalized product suggestions. Replace 'I apologize' with positive, solution-focused responses like 'Let me help you find an alternative' or 'Here's what we can do.' Prioritize both accuracy and customer satisfaction while maintaining a warm, professional tone throughout each interaction."
+      AutoPrepare: true
+      Description: Bedrock Agent for DAT301
+      FoundationModel: anthropic.claude-3-5-sonnet-20240620-v1:0
+      KnowledgeBases:
+        - Description: "Knowledgebase for DAT301"
+          KnowledgeBaseId: !GetAtt AmazonBedrockAgentKnowledgebase.KnowledgeBaseId
+          KnowledgeBaseState: ENABLED
+
+  BedrockAgentAlias:
+    Type: AWS::Bedrock::AgentAlias
+    DependsOn: AmazonBedrockAgent
+    Properties:
+      AgentAliasName: "latest"
+      AgentId: !Ref AmazonBedrockAgent
+
+# Auto-ingestion Lambda Function
+  KBAutoSyncLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAgentAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "bedrock:CreateKnowledgeBase"
+                  - "bedrock:DeleteKnowledgeBase"
+                  - "bedrock:GetKnowledgeBase"
+                  - "bedrock:ListKnowledgeBases"
+                  - "bedrock:UpdateKnowledgeBase"
+                  - "bedrock:StartIngestionJob"
+                  - "bedrock:GetIngestionJob"
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:*"
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: 
+                  - !Sub "arn:aws:s3:::${BedrockKB}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${BedrockKB}"
+
+  KBAutoSyncLambda:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - KBAutoSyncLambdaRole
+      - AmazonBedrockAgentDatasource
+      - AmazonBedrockAgentKnowledgebase
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt KBAutoSyncLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+
+          bedrockClient = boto3.client('bedrock-agent')
+
+          def lambda_handler(event, context):
+              print('Inside Lambda Handler')
+              print('event: ', event)
+              dataSourceId = os.environ['DATASOURCEID']
+              knowledgeBaseId = os.environ['KNOWLEDGEBASEID']
+              
+              print('knowledgeBaseId: ', knowledgeBaseId)
+              print('dataSourceId: ', dataSourceId)
+
+              response = bedrockClient.start_ingestion_job(
+                  knowledgeBaseId=knowledgeBaseId,
+                  dataSourceId=dataSourceId
+              )
+              
+              print('Ingestion Job Response: ', response)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('response')
+              }
+      Runtime: python3.11
+      Timeout: 300
+      Environment:
+        Variables:
+          DATASOURCEID: !GetAtt AmazonBedrockAgentDatasource.DataSourceId
+          KNOWLEDGEBASEID: !GetAtt AmazonBedrockAgentKnowledgebase.KnowledgeBaseId
+
+  KBAutoSyncLambdaPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn: KBAutoSyncLambda
+    Properties:
+      FunctionName: !Ref KBAutoSyncLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt BedrockKB.Arn
+  
+  # Update bucket with notifications after Lambda and permissions are created
+  BucketNotificationsCustomResource:
+    Type: Custom::S3BucketNotifications
+    DependsOn: 
+      - BedrockKB
+      - KBAutoSyncLambda
+      - KBAutoSyncLambdaPermission
+    Properties:
+      ServiceToken: !GetAtt NotificationSetupFunction.Arn
+      BucketName: !Ref BedrockKB
+      NotificationConfiguration:
+        LambdaFunctionConfigurations:
+          - LambdaFunctionArn: !GetAtt KBAutoSyncLambda.Arn
+            Events: 
+              - s3:ObjectCreated:*
+          - LambdaFunctionArn: !GetAtt KBAutoSyncLambda.Arn
+            Events: 
+              - s3:ObjectRemoved:*
+
+  # Lambda function to set up bucket notifications
+  NotificationSetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt NotificationSetupRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          
+          def lambda_handler(event, context):
+              try:
+                  print(event)
+                  if event['RequestType'] in ['Create', 'Update']:
+                      s3 = boto3.client('s3')
+                      bucket = event['ResourceProperties']['BucketName']
+                      configuration = event['ResourceProperties']['NotificationConfiguration']
+                      
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration=configuration
+                      )
+                      
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      Runtime: python3.11
+      Timeout: 60
+
+  NotificationSetupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3NotificationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                Resource: !GetAtt BedrockKB.Arn
+
+Outputs:
+
+  DBEndpoint:
+    Description: "Aurora PostgreSQL Endpoint"
+    Value: !Ref APGClusterEP
+    Export:
+      Name:
+        "Fn::Sub": "${TemplateName}-DBEndPoint"
+
+  DBSecret:
+    Description: Database Secret
+    Value: !Ref RDSSecrets
+    Export:
+      Name:
+        "Fn::Sub": "${TemplateName}-DBSecrets"
+    
+  BedrockAgentId:
+    Description: Agent ID
+    Value : !Ref AmazonBedrockAgent
+  
+  BedrockKnowledgeBaseId:
+    Description: ID of the Knowledge base
+    Value: !Ref AmazonBedrockAgentKnowledgebase
+  
+  BedrockS3Bucket:
+    Description: S3 bucket for the Knowledge Source
+    Value: !Ref BedrockKB
+  
+  S3BucketName:
+    Description: "Name of the S3 bucket"
+    Value: !Ref BedrockKB
+  
+  BedrockAgentAliasId:
+    Description: Bedrock Agent Alias
+    Value: !Ref BedrockAgentAlias
+
+  LambdaFunctionName:
+    Description: Name of the Bedrock Agent Lambda Function
+    Value: !Ref BedrockAgentActionLambda
+    Export:
+      Name: !Sub "${TemplateName}-BedrockAgentLambdaName"

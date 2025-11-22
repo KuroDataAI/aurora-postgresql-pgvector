@@ -1,0 +1,1406 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Transform: 'AWS::LanguageExtensions'
+
+Mappings:
+  RDSPGQAMap:
+    "1":
+      MajorVersion: "15"
+      InstanceSize: "db.t4g.small"
+    "2":
+      MajorVersion: "14"
+      InstanceSize: "db.t4g.small"
+    "3":
+      MajorVersion: "13"
+      InstanceSize: "db.t4g.small"
+    "4":
+      MajorVersion: "12"
+      InstanceSize: "db.t4g.small"
+ 
+Description: >
+    This template deploys a VPC, Aurora DB Cluster, and a Amazon SageMaker Notebook Instance
+
+Parameters:
+
+  AssetsBucketName:
+    Type: String
+    
+  AssetsBucketPrefix:
+    Type: String
+ 
+  TemplateName:
+    Type: String
+
+  DBVersion:
+    Type: String
+
+  RDSSecrets:
+    Type: String
+
+  PrivateSubnets:
+    Type: String
+
+  VpcCIDR:
+    Type: String
+
+  VPC:
+    Type: String
+
+  PrivateRouteTable:
+    Type: String
+
+  APGCluster:
+    Type: String
+
+  RDSDBInstanceSize:
+    Type: String
+    Default: db.t4g.small
+    AllowedValues:
+      - db.t4g.small
+      - db.t3.small
+      - db.r6g.2xlarge
+      - db.r6gd.2xlarge
+      - db.r6g.4xlarge
+      - db.r6gd.4xlarge
+
+  DBPort:
+    Description: TCP/IP Port for the Database Instance
+    Type: Number
+    Default: 5432
+    ConstraintDescription: 'Must be in the range [1150-65535]'
+    MinValue: 1150
+    MaxValue: 65535
+
+  MinCapacity:
+    Description: Aurora Serverless V2 minACU
+    Type: Number
+    Default: 0.5
+
+  MaxCapacity:
+    Description: Aurora Serverless V2 maxACU
+    Type: Number
+    Default: 4.0
+
+  KnowledgeBaseNameIDR:
+    Default: idr-kb
+    Type: String
+    Description: The name of the knowledge base for IDR.
+
+  KnowledgeBaseNameQA:
+    Default: qa-kb
+    Type: String
+    Description: The name of the knowledge base for QA.
+
+  BackupRetentionPeriod:
+    Type: Number
+    Default: 7
+    Description : Backup retention period for the Aurora and RDS instances
+
+  RDSVersionLambdaFunction:
+    Type: String
+    
+Resources:
+
+# Aurora PostgreSQL -----------------------------------------------
+
+  roleEnhancedMonitoring:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - monitoring.rds.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+  EncryptionKey:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: !Ref AWS::StackName
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}"
+      TargetKeyId: !Ref EncryptionKey
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "RDS DB Subnet Group"
+      SubnetIds: !Split [',', !Ref PrivateSubnets] 
+
+  ## Create parameter groups for DB cluster
+  apgcustomclusterparamgroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: "Aurora PostgreSQL Custom Cluster parameter group"
+      Family: aurora-postgresql16
+      Parameters:
+        shared_preload_libraries: "pg_stat_statements"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-clusterparamgroup"
+  
+  ## Create parameter groups for cluster nodes
+  apgcustomdbparamgroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub ${AWS::StackName}-dbparamgroup
+      Family: aurora-postgresql16
+      Parameters:
+        log_rotation_age: '1440'
+        log_rotation_size: '102400'
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-dbparamgroup
+
+  ## Create a parameter group for RDS instances
+  rdspgcustomdbparamgroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub ${AWS::StackName}-rdspgdbgrp
+      Family: postgres16
+      Parameters:
+        rds.force_ssl: '0'
+        log_rotation_age: '1440'
+        log_rotation_size: '102400'
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-rdspgdbgrp
+
+  RDSCPUSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: "rdspg-idr-cpu-secret"
+      Description: 'This is the secret for RDS CPU instance'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "postgres" }'
+        GenerateStringKey: 'password'
+        PasswordLength: 16
+        ExcludePunctuation: true
+
+  RDSIOPSSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: "rdspg-idr-iops-secret"
+      Description: 'This is the secret for RDS IOPS instance'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "postgres" }'
+        GenerateStringKey: 'password'
+        PasswordLength: 16
+        ExcludePunctuation: true
+
+  APGACUSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: "apg-idr-acu-secret"
+      Description: 'This is the secret for Aurora ACU cluster'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "postgres" }'
+        GenerateStringKey: 'password'
+        PasswordLength: 16
+        ExcludePunctuation: true
+
+  VPCSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: !Ref 'AWS::StackName'
+      SecurityGroupEgress:
+      - IpProtocol: -1
+        CidrIp: "0.0.0.0/0"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: !Ref DBPort
+        ToPort: !Ref DBPort
+        CidrIp: !Ref VpcCIDR
+        Description: 'Access to AppServer Host Security Group'
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-DBSecurityGroup'
+
+
+## Create Aurora cluster for ACU incident
+
+  APGACUVersion:
+    Type: Custom::Variable
+    Properties:
+      ServiceToken: !Ref RDSVersionLambdaFunction
+      Engine: "aurora-postgresql"
+      EngineMajorVersion: !Ref DBVersion
+
+  APGACUCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DBClusterIdentifier: "apg-idr-acu"
+      Engine: aurora-postgresql
+      Port: !Ref DBPort
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref APGACUSecrets, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref APGACUSecrets, ':SecretString:password}}' ]]
+      DBClusterParameterGroupName: !Ref apgcustomclusterparamgroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      AutoMinorVersionUpgrade: true
+      EngineVersion: !GetAtt APGACUVersion.EngineVersion
+      KmsKeyId: !Ref EncryptionKey
+      StorageEncrypted: true
+      StorageType: aurora-iopt1
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      DeletionProtection: false
+      VpcSecurityGroupIds: [ !Ref VPCSecurityGroup ]
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref MinCapacity
+        MaxCapacity: !Ref MaxCapacity
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}"
+
+## Deploy the first cluster node (always the writer)
+  APGACUNodeWriter:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref APGACUCluster
+      DBInstanceIdentifier: "apg-idr-acu-node-01"
+      DBInstanceClass: "db.serverless"
+      DBParameterGroupName: !Ref apgcustomdbparamgroup
+      Engine: aurora-postgresql
+      MonitoringInterval: 1
+      MonitoringRoleArn: !GetAtt roleEnhancedMonitoring.Arn
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      AutoMinorVersionUpgrade: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-node-01
+
+  APGACUSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref APGACUSecrets
+      TargetId: !Ref APGACUCluster
+      TargetType: AWS::RDS::DBCluster
+
+
+  RDSPGCPUVersion:
+    Type: Custom::Variable
+    Properties:
+      ServiceToken: !Ref RDSVersionLambdaFunction
+      Engine: "postgres"
+      EngineMajorVersion: !Ref DBVersion
+
+  RDSPGCPU:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: "rdspg-idr-cpu"
+      CopyTagsToSnapshot: true
+      DBInstanceClass: !Ref RDSDBInstanceSize
+      Engine: postgres
+      EngineVersion: !GetAtt RDSPGCPUVersion.EngineVersion
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      AutoMinorVersionUpgrade: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [ !Ref VPCSecurityGroup ]
+      Port: !Ref DBPort
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref RDSCPUSecrets, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref RDSCPUSecrets, ':SecretString:password}}' ]]
+      KmsKeyId: !Ref EncryptionKey
+      StorageEncrypted: true
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      DeletionProtection: false
+      AllocatedStorage: 20
+      DBParameterGroupName: !Ref rdspgcustomdbparamgroup
+      Tags:
+        - Key: Name
+          Value: "rdspg-idr-cpu"
+
+  RDSCPUSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref RDSCPUSecrets
+      TargetId: !Ref RDSPGCPU
+      TargetType: AWS::RDS::DBInstance
+
+  RDSPGIOPSVersion:
+    Type: Custom::Variable
+    Properties:
+      ServiceToken: !Ref RDSVersionLambdaFunction
+      Engine: "postgres"
+      EngineMajorVersion: !Ref DBVersion
+
+  RDSPGIOPS:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: "rdspg-idr-iops"
+      CopyTagsToSnapshot: true
+      DBInstanceClass: !Ref RDSDBInstanceSize
+      Engine: postgres
+      EngineVersion: !GetAtt RDSPGIOPSVersion.EngineVersion
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      AutoMinorVersionUpgrade: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [ !Ref VPCSecurityGroup ]
+      Port: !Ref DBPort
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref RDSIOPSSecrets, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref RDSIOPSSecrets, ':SecretString:password}}' ]]
+      KmsKeyId: !Ref EncryptionKey
+      StorageEncrypted: true
+      BackupRetentionPeriod: !Ref BackupRetentionPeriod
+      DeletionProtection: false
+      AllocatedStorage: 200
+      StorageType: "IO1"
+      Iops: 1000
+      DBParameterGroupName: !Ref rdspgcustomdbparamgroup
+      Tags:
+        - Key: Name
+          Value: "rdspg-idr-iops"
+
+  RDSIOPSSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref RDSIOPSSecrets
+      TargetId: !Ref RDSPGIOPS
+      TargetType: AWS::RDS::DBInstance
+
+  Fn::ForEach::RDSPGInstances:
+    - InstanceNumber
+    - - "1"
+      - "2"
+      - "3"
+      - "4"
+    - RDSPGQAVersion${InstanceNumber}:
+        Type: Custom::Variable
+        Properties:
+          ServiceToken: !Ref RDSVersionLambdaFunction
+          Engine: "postgres"
+          EngineMajorVersion: 
+            Fn::FindInMap: ["RDSPGQAMap", !Ref InstanceNumber, "MajorVersion"]
+      RDSPGQA${InstanceNumber}:
+        Type: AWS::RDS::DBInstance
+        Properties:
+          DBInstanceIdentifier: !Sub "rdspg-idr-qa${InstanceNumber}"
+          CopyTagsToSnapshot: true
+          DBInstanceClass: 
+            Fn::FindInMap: ["RDSPGQAMap", !Ref InstanceNumber, "InstanceSize"]
+          Engine: postgres
+          EngineVersion:
+            Fn::GetAtt:
+              - !Sub RDSPGQAVersion${InstanceNumber}
+              - EngineVersion
+          PubliclyAccessible: false
+          EnablePerformanceInsights: false
+          AutoMinorVersionUpgrade: false
+          DBSubnetGroupName: !Ref DBSubnetGroup
+          VPCSecurityGroups: [ !Ref VPCSecurityGroup ]
+          Port: !Ref DBPort
+          MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref RDSSecrets, ':SecretString:username}}' ]]
+          MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref RDSSecrets, ':SecretString:password}}' ]]
+          KmsKeyId: !Ref EncryptionKey
+          StorageEncrypted: true
+          BackupRetentionPeriod: !Ref BackupRetentionPeriod
+          DeletionProtection: false
+          AllocatedStorage: 20
+          Tags:
+            - Key: Name
+              Value: !Sub "rdspg-idr-qa${InstanceNumber}"
+
+# End Aurora PostgreSQL -----------------------------------------------
+
+# Lambda functions for the Alarms
+
+  CWIngestTODynamoDBFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "cw-ingest-to-dynamodb"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 300
+      Environment:
+        Variables:
+          CWALERTTABLE: !Ref CWAlertTable
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              # TODO implement
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Hello from Lambda!')
+              }
+
+  CWIngestTODynamoDBFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CWIngestTODynamoDBFunction
+      Action: lambda:InvokeFunction
+      Principal: lambda.alarms.cloudwatch.amazonaws.com
+
+#----------------------------------------------------------------------
+# Lambda functions for the Agents
+
+  IDRAgentActionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "idr-bedrock-agent-action-group"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 600
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              # TODO implement
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Hello from Lambda!')
+              }
+
+      Layers:
+        - !Ref LambdaPsycopg2Layer
+
+  IDRAgentActionFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IDRAgentActionFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+
+  QAAgentActionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "qa-bedrock-agent-action-group"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 600
+      Environment:
+        Variables:
+          CWALERTTABLE: !Ref CWAlertTable
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              # TODO implement
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Hello from Lambda!')
+              }
+      Layers:
+        - !Ref LambdaPsycopg2Layer
+
+  QAAgentActionFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QAAgentActionFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+#----------------------------------------------------------------------
+
+# Creating the Cloudwatch Alerts
+
+  CWIOPSAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+        AlarmName: cw-iops-alarm
+        AlarmDescription: rdspg-idr-iops RDS instance is reaching IOPS limit. Fix the issue using runbook
+        ActionsEnabled: true
+        OKActions: []
+        AlarmActions:
+            - !GetAtt CWIngestTODynamoDBFunction.Arn
+        InsufficientDataActions: []
+        EvaluationPeriods: 1
+        DatapointsToAlarm: 1
+        Threshold: 1000
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+        Metrics:
+            - Id: e1
+              Label: TotalIOPS
+              ReturnData: true
+              Expression: SUM(METRICS())
+            - Id: m1
+              ReturnData: false
+              MetricStat:
+                  Metric:
+                      Namespace: AWS/RDS
+                      MetricName: WriteIOPS
+                      Dimensions:
+                          - Name: DBInstanceIdentifier
+                            Value: rdspg-idr-iops
+                  Period: 60
+                  Stat: Maximum
+            - Id: m2
+              ReturnData: false
+              MetricStat:
+                  Metric:
+                      Namespace: AWS/RDS
+                      MetricName: ReadIOPS
+                      Dimensions:
+                          - Name: DBInstanceIdentifier
+                            Value: rdspg-idr-iops
+                  Period: 60
+                  Stat: Maximum
+
+  CWCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: cw-cpu-alarm
+      AlarmDescription: rdspg-idr-cpu RDS instance is encountering high CPU usage. Fix the issue using runbook
+      ActionsEnabled: true
+      OKActions: []
+      AlarmActions:
+          - !GetAtt CWIngestTODynamoDBFunction.Arn
+      InsufficientDataActions: []
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Maximum
+      Dimensions:
+          - Name: DBInstanceIdentifier
+            Value: rdspg-idr-cpu
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+# ----------------------------------------------------------------------
+
+# DynamoDB Table  -----------------------------------------------
+
+  CWAlertTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: 'cwalerttable'
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+# End of DynamoDB Table creation ---------------------------------------
+
+# Cognito User Pool creation -------------------------------
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: IDRUserPool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      LambdaConfig:
+        PreSignUp: !GetAtt CognitoPreapproverFunction.Arn
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+
+  # Cognito User Pool Client
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: IDRUserPoolClient
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  # Cognito Identity Pool
+  CognitoIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: IDRIdentityPool
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref CognitoUserPoolClient
+          ProviderName: !GetAtt CognitoUserPool.ProviderName
+
+  # IAM Role for authenticated users
+  CognitoAuthRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref CognitoIdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': authenticated
+      Policies:
+        - PolicyName: CognitoAuthorizedPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - mobileanalytics:PutEvents
+                  - cognito-sync:*
+                  - cognito-identity:*
+                Resource: '*'
+
+  # Attach the IAM Role to the Identity Pool
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref CognitoIdentityPool
+      Roles:
+        authenticated: !GetAtt CognitoAuthRole.Arn
+
+  # Lambda function to preapprove the users
+  CognitoPreapproverFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "cognito-pre-approver"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+            event['response']['autoConfirmUser'] = True
+            if 'email' in event['request']['userAttributes']:
+              event['response']['autoVerifyEmail'] = True
+            if 'phone_number' in event['request']['userAttributes']:
+              event['response']['autoVerifyPhone'] = True
+            return event
+
+  CognitoPreapproverFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CognitoPreapproverFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+
+  # Attach the above lambda function to the cognito user
+
+
+# Cognito User Pool creation -------------------------------
+
+# Lambda execution role for all the lambda's  --------------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/AmazonRDSFullAccess
+
+## Lambda execution role for all the lambda's  --------------
+# API Gateway creation -------------------------------
+  # API Gateway
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: IDRAPIGateway
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'execute-api:Invoke'
+            Resource: 'execute-api:/*'
+
+  GetIncidentsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: 'get-incidents'
+
+  GetIncidentsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ResourceId: !Ref GetIncidentsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayCognitoAuthorizer
+      RequestParameters:
+        method.request.querystring.incidentStatus: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt GetIncidentsFunction.Arn
+
+  GetIncidentsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "api-get-incidents"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 300
+      Environment:
+        Variables:
+          CWALERTTABLE: !Ref CWAlertTable
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              # TODO implement
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Hello from Lambda!')
+              }
+
+  GetIncidentsFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetIncidentsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      
+  GetRunbookResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: 'get-incident-runbook'
+
+  GetRunbookMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ResourceId: !Ref GetRunbookResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayCognitoAuthorizer
+      RequestParameters:
+        method.request.querystring.query: true
+        method.request.querystring.id: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt GetRunbookFunction.Arn
+
+  GetRunbookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "api-list-runbook-kb"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 300
+      Environment:
+        Variables:
+          KBID: !Ref KnowledgeBaseforIDR
+          CWALERTTABLE: !Ref CWAlertTable
+
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              # TODO implement
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Hello from Lambda!')
+              }
+
+  GetRunbookFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetRunbookFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  PostAgentActionResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: 'post-incident-action'
+
+  PostAgentActionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ResourceId: !Ref PostAgentActionResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayCognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt PostAgentActionsFunction.Arn
+
+  PostAgentActionsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: "api-action-runbook-kb"
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 300
+      Environment:
+        Variables:
+          AGENTID: !Ref IDRAgentResource
+          CWALERTTABLE: !Ref CWAlertTable
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              # TODO implement
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Hello from Lambda!')
+              }
+
+  PostAgentActionsFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PostAgentActionsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - GetIncidentsMethod
+      - GetRunbookMethod
+      - PostAgentActionsMethod
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+
+  ApiGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiGatewayDeployment
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: 'prod'
+
+  ApiGatewayCognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: IDRAuthorizer
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      RestApiId: !Ref ApiGatewayRestApi
+      ProviderARNs:
+        - !GetAtt CognitoUserPool.Arn
+
+# Creating bucket for loading Knowledge Base for Bedrock
+  KBIDR:
+    Type: AWS::S3::Bucket
+
+  KBQA:
+    Type: AWS::S3::Bucket
+
+# ----------------------------------------------------------------------
+# Bootstrap database using Lambda layer for psycopg2
+
+  LambdaPsycopg2Layer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleRuntimes:
+        - python3.12
+      Content:
+        S3Bucket: !Ref AssetsBucketName
+        S3Key: !Sub "${AssetsBucketPrefix}psycopg2-layer-3.12.zip"
+      Description: Psycopg2 layer for Python3.12
+      LayerName: psycopg2-layer
+      LicenseInfo: MIT
+
+  BootstrapLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+      Policies:
+        - PolicyName: LambdaRDSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds-data:ExecuteStatement
+                  - secretsmanager:GetSecretValue
+                Resource: '*'
+      Description: IAM role to provide needed permission for Lambda function to execute and store logs in cloudwatch
+
+  BootstrapLambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [LambdaPsycopg2Layer ]
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-BootstrapAurora'
+      Description: Run SQL Scripts on Aurora PostgreSQL Database using AWS Lambda function
+      Handler: index.lambda_handler
+      Role: !GetAtt BootstrapLambdaRole.Arn
+      Runtime: python3.12
+      MemorySize: 2048
+      Timeout: 900
+      Environment:
+        Variables:
+          DBUSER: !Sub '{{resolve:secretsmanager:${RDSSecrets}:SecretString:username}}'
+          DBPASSWD: !Sub '{{resolve:secretsmanager:${RDSSecrets}:SecretString:password}}'
+          HOST: !Sub '{{resolve:secretsmanager:${RDSSecrets}:SecretString:host}}'
+          PORT: !Sub '{{resolve:secretsmanager:${RDSSecrets}:SecretString:port}}'
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import psycopg2
+          import os
+
+          def lambda_handler(event, context):
+              print (event)
+              print (context)
+              responseData = {}
+
+              if event['RequestType'] == 'Delete':
+                responseData = {'Message': 'SUCCESSFUL'}
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+                return
+
+              try:
+                """
+                Database Information
+                """
+                uname = os.environ.get('DBUSER')
+                userpwd = os.environ.get('DBPASSWD')
+                dbname = "postgres"
+                port = os.environ.get('PORT')
+                endpoint = os.environ.get('HOST')
+                """
+                Run sql commands to initialize Product catalog schema in RDS for PostgreSQL
+                """
+
+                with psycopg2.connect(user=uname, password=userpwd, database=dbname, port=port, host=endpoint, connect_timeout=60) as dbconn:
+                  with dbconn.cursor() as cursor:
+                    cursor.execute("SELECT * FROM pg_extension WHERE extname = 'vector';")
+                    if not cursor.fetchone():
+                      cursor.execute("CREATE EXTENSION vector;")
+                    else:
+                      print("Vector extension already exists, skipping creation")
+                    cursor.execute("""CREATE TABLE IF NOT EXISTS public.idr_kb(
+                                      id uuid PRIMARY KEY,
+                                      embedding vector(1024),
+                                      chunks text,
+                                      metadata json
+                                );""")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idr_kb_embedding_idx ON idr_kb USING hnsw (embedding vector_cosine_ops);")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS idr_kb_chunks_idx ON idr_kb USING gin (to_tsvector('simple', chunks));")
+                    cursor.execute("""CREATE TABLE IF NOT EXISTS public.qa_kb(
+                                      id uuid PRIMARY KEY,
+                                      embedding vector(1024),
+                                      chunks text,
+                                      metadata json
+                                );""")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS qa_kb_embedding_idx ON qa_kb USING hnsw (embedding vector_cosine_ops);")
+                    cursor.execute("CREATE INDEX IF NOT EXISTS qa_kb_chunks_idx ON qa_kb USING gin (to_tsvector('simple', chunks));")
+                  dbconn.commit()
+                responseData = {'Message': 'SUCCESSFUL!!'}
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+              except Exception as e:
+                print('Exception: ' + str(e))
+                responseData = {'Message': 'FAILED!!'}
+                cfnresponse.send(event, context, cfnresponse.FAILED, responseData, "CustomResourcePhysicalID")
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:psycopg2-layer:1"
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt BoostrapSG.GroupId
+        SubnetIds: !Split [',', !Ref PrivateSubnets]
+
+  BootstrapCustomResoure:
+    DependsOn: [ LambdaPsycopg2Layer ]
+    Type: Custom::DBBootstrap
+    Properties:
+      ServiceToken: !GetAtt BootstrapLambdaFunction.Arn
+
+  BoostrapSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Security group for Lambda which will execute the post database creation steps
+      GroupName: post_lambda_sg
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic by default
+          IpProtocol: '-1'
+      VpcId: !Ref VPC
+
+# ----------------------------------------------------------------------
+# Bedrock knowldegebase
+
+  KBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "idr-qa-bedrock-agent-role"
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: bedrock.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+        - arn:aws:iam::aws:policy/SecretsManagerReadWrite
+        - arn:aws:iam::aws:policy/AmazonRDSFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonRDSDataFullAccess
+
+  KnowledgeBaseforIDR:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn: [BootstrapCustomResoure]
+    Properties:
+      Name: !Ref KnowledgeBaseNameIDR
+      Description: Knowledge base for providing runbook based on incidents
+      RoleArn: !GetAtt KBRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: "VECTOR"
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+      StorageConfiguration:
+        Type: "RDS"
+        RdsConfiguration:
+          ResourceArn: !Sub "arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:cluster:${APGCluster}"
+          CredentialsSecretArn: !Ref RDSSecrets
+          DatabaseName: "postgres"
+          TableName: "public.idr_kb"
+          FieldMapping:
+            VectorField: "embedding"
+            TextField: "chunks"
+            MetadataField: "metadata"
+            PrimaryKeyField: "id"
+
+  KBIDRDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref KnowledgeBaseforIDR
+      Name: idr-kb-runbook
+      Description: Source for the runbooks
+      DataSourceConfiguration:
+        Type: "S3"
+        S3Configuration:
+          BucketArn: !GetAtt KBIDR.Arn
+
+  KnowledgeBaseforQA:
+    Type: AWS::Bedrock::KnowledgeBase
+    DependsOn: [BootstrapCustomResoure]
+    Properties:
+      Name: !Ref KnowledgeBaseNameQA
+      Description: Knowledge base for providing documentation for RDS
+      RoleArn: !GetAtt KBRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: "VECTOR"
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:${AWS::Partition}:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-text-v2:0"
+      StorageConfiguration:
+        Type: "RDS"
+        RdsConfiguration:
+          ResourceArn: !Sub "arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:cluster:${APGCluster}"
+          CredentialsSecretArn: !Ref RDSSecrets
+          DatabaseName: "postgres"
+          TableName: "public.qa_kb"
+          FieldMapping:
+            VectorField: "embedding"
+            TextField: "chunks"
+            MetadataField: "metadata"
+            PrimaryKeyField: "id"
+
+  KBQADataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      KnowledgeBaseId: !Ref KnowledgeBaseforQA
+      Name: qa-kb-documentation
+      Description: Source for the documentation
+      DataSourceConfiguration:
+        Type: "S3"
+        S3Configuration:
+          BucketArn: !GetAtt KBQA.Arn
+
+  IDRAgentResource:
+      Type: AWS::Bedrock::Agent
+      Properties:
+        AgentName: idr-agent
+        AgentResourceRoleArn: !GetAtt KBRole.Arn
+        AutoPrepare: true
+        FoundationModel: "anthropic.claude-3-haiku-20240307-v1:0"
+        Instruction: |
+          You are a PostreSQL Database Administrator and your primary job is to analyze the incident reported and take any remedial actions.
+          You will receive the alerts or incidents as a tasks and you will carry the root cause analysis.
+          As a first step in the analysis, you will search the knowledge base for any available runbook for instructions.
+          The knowledge base provides the runbook which contains the step by step instructions to remedie the alert generated.
+          If you don't find the proper instructions from the knowledge base, end the conversation by saying "I couldn't find the runbook" and end the response.
+          You retrieve the instructions from the knowledge base and execute the steps in the knowlege base one at a time using the proper functions/tooling.
+          Strictly follow the instructions in the runbook and don't execute any other steps on your own.
+          Stictly use only the functions required to carry out the operations in the proper order provided by the knowledge base instructions.
+          Finally summarize the actions you have taken.
+        Description: Agent in charge of incident detection and resolution on AWS
+        IdleSessionTTLInSeconds: 900
+        KnowledgeBases:
+          - KnowledgeBaseId: !Ref KnowledgeBaseforIDR
+            Description: The knowledge base contains the runbook for the specific incident.
+            KnowledgeBaseState: ENABLED
+        ActionGroups:
+          - ActionGroupExecutor:
+              Lambda: !GetAtt IDRAgentActionFunction.Arn
+            ActionGroupName: idr-agent-action-group
+            ActionGroupState: ENABLED
+            Description: Action group responsible for executing the step by step instructions provided from the knowledge base
+            FunctionSchema:
+              Functions:
+                - Name: check_rds_state
+                  Description: Function checks the current RDS state using the db_instance_identifier parameter
+                  Parameters:
+                    db_instance_identifier:
+                      Description: Instance identifier to check the instance state
+                      Required: true
+                      Type: string
+                - Name: run_query
+                  Description: |
+                    Function to run the SQL query passed as a parameter on the given database instance identifier
+                  Parameters:
+                    db_instance_identifier:
+                      Description: Instance to run the query
+                      Required: true
+                      Type: string
+                    query:
+                      Description: SQL Query to be run
+                      Required: true
+                      Type: string
+                - Name: get_cpu_metrics
+                  Description: |
+                    Function to get the CPUUtilization metric on the given instance identifier in the last amout of time specified
+                  Parameters:
+                    db_instance_identifier:
+                      Description: Instance identifier to get the CPU usage
+                      Required: true
+                      Type: string
+                    metric_time:
+                      Description: How many hours behind to get the CPU metrics
+                      Required: true
+                      Type: string
+                - Name: get_iops_metrics
+                  Description: |
+                    Function to get the IOPS metrics on the given instance identifier.
+                    It takes db_instance_identifier and metric_time as a parameter.
+                    The metric time is specified in hours for which the IOPS metris needs to be calculated
+                  Parameters:
+                    db_instance_identifier:
+                      Description: Instance identifier to get the IOPS usage
+                      Required: true
+                      Type: string
+                    metric_time:
+                      Description: How many hours behind to get the IOPS metrics
+                      Required: true
+                      Type: string
+                - Name: scale_up_instance
+                  Description: |
+                    Function to scale up the instance to the next available instance class to fix the alert CPUUtilization.
+                  Parameters:
+                    db_instance_identifier:
+                      Description: Instance identifier where the scale up needs to happen
+                      Required: true
+                      Type: string
+                - Name: increase_iops
+                  Description: Function to increase the IOPS provisioned on the given instance identifier
+                  Parameters:
+                    db_instance_identifier:
+                      Description: Instance identifier where the IOPS needs to be increased
+                      Required: true
+                      Type: string
+                    percent_increase:
+                      Description: Percentage of IOPS needs to be increased in the given instance identifier
+                      Required: true
+                      Type: string
+                - Name: get_provisioned_iops
+                  Description: Functions gets the provisioned IOPS of the given RDS instance.
+                  Parameters:
+                    db_instance_identifier:
+                      Description: Instance identifier to get the provisioned iops
+                      Required: true
+                      Type: string
+
+  QAAgentResource:
+      Type: AWS::Bedrock::Agent
+      Properties:
+        AgentName: qa-agent
+        AgentResourceRoleArn: !GetAtt KBRole.Arn
+        AutoPrepare: true
+        FoundationModel: "anthropic.claude-3-haiku-20240307-v1:0"
+        Instruction: |
+            You are a infrastrucure engineer and your primary job is to analyze the infrastrure and provide answers to the questions
+            If the questions are related to the infrastructure, come up with the python boto3 command and call the correspoding function to execute it. 
+            If the questions are related to performance metrics, call the corrsponding functions to gather the information and augument your result with the knowledge base
+            Stictly use only the functions required to carry out the operations.
+            Provide a detailed analysis of your answers and why you arrived the conclusion
+        Description: Agent for answering questions on the infrastructure
+        IdleSessionTTLInSeconds: 900
+        KnowledgeBases:
+          - KnowledgeBaseId: !Ref KnowledgeBaseforQA
+            Description: The knowledge base contains the runbook for the specific incident.
+            KnowledgeBaseState: ENABLED
+        ActionGroups:
+          - ActionGroupExecutor:
+              Lambda: !GetAtt QAAgentActionFunction.Arn
+            ActionGroupName: qa-agent-action-group
+            ActionGroupState: ENABLED
+            Description: Action group responsible for executing the infrastructure related instructions
+            FunctionSchema:
+              Functions:
+                - Name: gather_metrics
+                  Description: Function to gather the relevant cloudwatch metrics for analysis
+                  Parameters:
+                    db_instance_identifier:
+                      Description: Instance identifier to check the instance state
+                      Required: true
+                      Type: string
+                    metric_name:
+                      Description: Name of the metric to be collected
+                      Required: true
+                      Type: string
+                    metric_stat:
+                      Description: Description of the metric stats
+                      Required: true
+                      Type: string
+                    metric_time:
+                      Description: Time duration in hours  to gather the metrics
+                      Required: true
+                      Type: string
+                - Name: gather_infra
+                  Description: |
+                    Function to gather the infrastructure of RDS instances in the currrent account
+                - Name: gather_incidents
+                  Description: |
+                    Function to gather the incidents occurred in the currrent account
+# ----------------------------------------------------------------------
+
+Outputs:
+
+  DBSecret:
+    Description: Database Secret
+    Value: !Ref RDSSecrets
+    Export:
+      Name:
+        'Fn::Sub': '${AWS::StackName}-DBSecrets'
+
+  AgentID:
+    Description: IDR Agent ID
+    Value : !Ref IDRAgentResource
+
+  KBIDRID:
+    Description: ID of the Knowledge base
+    Value: !Ref KnowledgeBaseforIDR
+
+  KBQAID:
+    Description: ID of the Knowledge base
+    Value: !Ref KnowledgeBaseforQA
+
+  CWAlertTable:
+    Description: DynamoDB table to store the alerts
+    Value: !Ref CWAlertTable
+
+  CognitoClientID:
+    Description: Cognito Client ID
+    Value: !Ref CognitoUserPoolClient
+
+  CognitoUserpoolID:
+    Description: Cognito Userpool ID
+    Value: !Ref CognitoUserPool
+
+  APIGatewayURL:
+    Description: API Gateway URL
+    Value: !Sub "https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/"
+
+  APIGatewayStage:
+    Description: API Gateway Stage Name
+    Value: !Ref ApiGatewayStage
+
+  KBIDRS3SourceBucketName:
+    Description: S3 bucket for the Knowledge Source
+    Value: !Ref KBIDR
+
+  KBIDRSourceID:
+    Description: ID of the Knowledgebase source for IDR
+    Value: !Ref KBIDRDataSource
+
+  KBQAS3SourceBucketName:
+    Description: S3 bucket for the Knowledge Source
+    Value: !Ref KBQA
+
+  KBQASourceID:
+    Description: ID of the Knowledgebase source for QA
+    Value: !Ref KBQADataSource
+
+  AssetsBucketName:
+    Description: Name of the Assets bucket
+    Value: !Ref AssetsBucketName
+
+  AssetsBucketPrefix:
+    Description: Name of the Assets bucket prefix
+    Value: !Ref AssetsBucketPrefix
+
+  S3LinkUrl:
+    Description: S3 URL to upload the generated logfile for verification
+    Value: !Sub "https://7yenxhb2u7.execute-api.${AWS::Region}.amazonaws.com/prod/dat307-upload-20241203/"

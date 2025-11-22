@@ -1,0 +1,427 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: >
+    This template creates database schema and sample data for the Text Summarization lab using SageMaker.
+    It sets up customer support case data for AI-powered summarization demonstrations.
+
+Parameters:
+  TemplateName:
+    Type: String
+    Description: Name used for different elements created.
+
+  AssetsBucketName:
+    Type: String
+    Description: Workshop studio magic variable AssetsBucketName
+
+  AssetsBucketPrefix:
+    Type: String
+    Description: Workshop studio magic variable AssetsBucketPrefix
+
+  RDSSecrets:
+    Type: String
+    Description: Secrets Manager secret containing database credentials
+
+  VPC:
+    Type: String
+    Description: VPC ID where database is located
+
+  PrivateSubnets:
+    Type: String
+    Description: Private subnet IDs for Lambda function
+
+  DBCluster:
+    Type: String
+    Description: Aurora PostgreSQL cluster identifier
+
+  APGClusterEP:
+    Type: String
+    Description: Aurora PostgreSQL cluster endpoint
+
+Resources:
+
+  # Lambda Layer for psycopg2
+  Psycopg2Layer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: text-summarization-psycopg2-layer
+      Description: Psycopg2 layer for Text Summarization data setup
+      Content:
+        S3Bucket: !Ref AssetsBucketName
+        S3Key: !Sub "${AssetsBucketPrefix}psycopg2-layer-3.12.zip"
+      CompatibleRuntimes:
+        - python3.12
+
+  # IAM Role for Lambda Bootstrap Function
+  TextSummarizationBootstrapRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+      Policies:
+        - PolicyName: TextSummarizationDataAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+      Description: IAM role for Text Summarization database setup Lambda function
+
+  # Security Group for Lambda
+  TextSummarizationSG:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: Security group for Text Summarization Lambda database setup
+      GroupName: text-summarization-lambda-sg
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+          IpProtocol: "-1"
+      VpcId: !Ref VPC
+
+  # Lambda Function to Create Schema and Load Data
+  TextSummarizationBootstrapFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: 
+      - TextSummarizationSG
+      - Psycopg2Layer
+    Properties:
+      FunctionName: !Sub '${TemplateName}-TextSumBoot'
+      Description: Create database schema and load sample support case data for Text Summarization lab
+      Handler: index.lambda_handler
+      Role: !GetAtt TextSummarizationBootstrapRole.Arn
+      Runtime: python3.12
+      MemorySize: 2048
+      Timeout: 900
+      Layers:
+        - !Ref Psycopg2Layer
+      Environment:
+        Variables:
+          DBSECRET: !Ref RDSSecrets
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt TextSummarizationSG.GroupId
+        SubnetIds: !Split [',', !Ref PrivateSubnets]
+      Code:
+        ZipFile: |
+          import psycopg2
+          import os
+          import boto3
+          import json
+          import logging
+          import cfnresponse
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def create_text_summarization_schema(event, context):
+              logger.info('Starting Text Summarization schema creation')
+              
+              try:
+                  # Get database credentials
+                  client = boto3.client('secretsmanager', region_name='us-west-2')
+                  secret_name = os.environ.get('DBSECRET')
+                  secret_value = client.get_secret_value(SecretId=secret_name)
+                  secret = json.loads(secret_value['SecretString'])
+                  
+                  uname = secret['username']
+                  userpwd = secret['password']
+                  dbname = secret.get('dbname', 'postgres')
+                  port = secret.get('port', 5432)
+                  endpoint = secret['host']
+                  
+                  # Connect to database using psycopg2
+                  conn = psycopg2.connect(
+                      host=endpoint,
+                      user=uname,
+                      password=userpwd,
+                      dbname=dbname,
+                      port=port,
+                      connect_timeout=60
+                  )
+                  conn.set_session(autocommit=True)
+                  
+                  with conn.cursor() as cur:
+                      logger.info('Creating Text Summarization tables...')
+                      
+                      # Create ServiceNameDetails table
+                      cur.execute("""
+                      CREATE TABLE IF NOT EXISTS ServiceNameDetails (
+                          ServiceNameID SERIAL PRIMARY KEY,
+                          ServiceName VARCHAR(255) NOT NULL UNIQUE
+                      );
+                      """)
+                      
+                      # Create CategoryTypeDetails table  
+                      cur.execute("""
+                      CREATE TABLE IF NOT EXISTS CategoryTypeDetails (
+                          CategoryTypeID SERIAL PRIMARY KEY,
+                          CategoryType VARCHAR(255) NOT NULL UNIQUE
+                      );
+                      """)
+                      
+                      # Create RequestorDetails table
+                      cur.execute("""
+                      CREATE TABLE IF NOT EXISTS RequestorDetails (
+                          RequestorID SERIAL PRIMARY KEY,
+                          RequestorName VARCHAR(255) NOT NULL,
+                          RequestorEmail VARCHAR(255)
+                      );
+                      """)
+                      
+                      # Create CaseOwnerDetails table
+                      cur.execute("""
+                      CREATE TABLE IF NOT EXISTS CaseOwnerDetails (
+                          CaseOwnerID SERIAL PRIMARY KEY,
+                          CaseOwnerName VARCHAR(255) NOT NULL,
+                          CaseOwnerEmail VARCHAR(255)
+                      );
+                      """)
+                      
+                      # Create PromptShare table
+                      cur.execute("""
+                      CREATE TABLE IF NOT EXISTS PromptShare (
+                          id VARCHAR(10) PRIMARY KEY,
+                          prompt TEXT NOT NULL
+                      );
+                      """)
+                      
+                      # Create CaseSummarisation main table
+                      cur.execute("""
+                      CREATE TABLE IF NOT EXISTS CaseSummarisation (
+                          CaseID VARCHAR(10) PRIMARY KEY,
+                          Subject VARCHAR(500),
+                          ServiceNameID INTEGER REFERENCES ServiceNameDetails(ServiceNameID),
+                          CategoryTypeID INTEGER REFERENCES CategoryTypeDetails(CategoryTypeID),
+                          RequestorID INTEGER REFERENCES RequestorDetails(RequestorID),
+                          CaseOwnerID INTEGER REFERENCES CaseOwnerDetails(CaseOwnerID),
+                          CaseNotes TEXT,
+                          Priority INTEGER,
+                          Feedback TEXT,
+                          CaseSummaryFlanT5 TEXT
+                      );
+                      """)
+                      
+                      logger.info('Loading reference data...')
+                      
+                      # Insert service types
+                      service_data = [
+                          ('Technical Support',),
+                          ('Billing Support',),
+                          ('Account Management',),
+                          ('Infrastructure Support',)
+                      ]
+                      for service in service_data:
+                          cur.execute(
+                              "INSERT INTO ServiceNameDetails (ServiceName) VALUES (%s) ON CONFLICT (ServiceName) DO NOTHING",
+                              service
+                          )
+                      
+                      # Insert category types
+                      category_data = [
+                          ('Performance Issue',),
+                          ('Configuration Problem',),
+                          ('Billing Inquiry',),
+                          ('Account Access',)
+                      ]
+                      for category in category_data:
+                          cur.execute(
+                              "INSERT INTO CategoryTypeDetails (CategoryType) VALUES (%s) ON CONFLICT (CategoryType) DO NOTHING",
+                              category
+                          )
+                      
+                      # Insert requestors
+                      requestor_data = [
+                          ('John Smith', 'john.smith@company.com'),
+                          ('Sarah Johnson', 'sarah.johnson@company.com'),
+                          ('Mike Wilson', 'mike.wilson@company.com'),
+                          ('Lisa Brown', 'lisa.brown@company.com')
+                      ]
+                      for requestor in requestor_data:
+                          cur.execute(
+                              "INSERT INTO RequestorDetails (RequestorName, RequestorEmail) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                              requestor
+                          )
+                      
+                      # Insert case owners
+                      owner_data = [
+                          ('Alex Rodriguez', 'alex.rodriguez@support.com'),
+                          ('Emily Chen', 'emily.chen@support.com'),
+                          ('David Kim', 'david.kim@support.com')
+                      ]
+                      for owner in owner_data:
+                          cur.execute(
+                              "INSERT INTO CaseOwnerDetails (CaseOwnerName, CaseOwnerEmail) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                              owner
+                          )
+                      
+                      logger.info('Creating AI summarization prompts...')
+                      
+                      # Insert AI prompts
+                      prompts_data = [
+                          ('CAS01', 'Summarize the following customer support case in a clear and concise manner:'),
+                          ('CAS02', 'Provide a brief summary of this technical support request:'),
+                          ('CAS03', 'Create a concise overview of this customer issue:'),
+                          ('CAS04', 'Summarize this billing support case:'),
+                          ('CAS05', 'Provide a clear summary of this database connectivity issue:'),
+                          ('CAS06', 'Summarize this account access problem:'),
+                          ('CAS07', 'Create a brief overview of this VPC configuration issue:'),
+                          ('CAS08', 'Summarize this DNS resolution problem:'),
+                          ('CAS09', 'Provide a concise summary of this notification issue:'),
+                          ('CAS10', 'Summarize this customer support case:')
+                      ]
+                      for case_id, prompt in prompts_data:
+                          cur.execute(
+                              "INSERT INTO PromptShare (id, prompt) VALUES (%s, %s) ON CONFLICT (id) DO NOTHING",
+                              (case_id, prompt)
+                          )
+                      
+                      logger.info('Loading 10 customer support cases...')
+                      
+                      # Insert 10 sample support cases
+                      cases_data = [
+                          ('CAS01', 'RDS Performance Issues During Peak Hours', 1, 1, 1, 1, 
+                           'Customer is experiencing slow performance on his RDS instance during peak business hours. Query execution times have increased from 2-3 seconds to 15-20 seconds. The issue started occurring after a recent application deployment. Customer has checked CloudWatch metrics and noticed high CPU utilization and increased read/write operations. They need assistance with optimization recommendations and possibly scaling solutions.',
+                           1, 'Customer confirmed that adding read replicas and optimizing queries resolved the performance issues.'),
+                          
+                          ('CAS02', 'EC2 Instance High CPU Utilization', 1, 1, 2, 1,
+                           'Requestor: I am experiencing slow performance on my EC2 instance. The CPU utilization has been consistently above 85% for the past week. My application response times have degraded significantly. I have t3.medium instances running a web application with moderate traffic. Need recommendations for scaling or instance type changes.',
+                           2, 'Issue resolved by upgrading to c5.large instances and implementing auto-scaling policies.'),
+                          
+                          ('CAS03', 'Lambda Function Timeout Errors', 1, 2, 1, 2,
+                           'Requestor\'s Lambda function is executing with an error. The function is timing out after 15 minutes when processing large datasets. Error logs show memory allocation issues and database connection timeouts. The function processes CSV files from S3 and writes results to RDS. Recent increase in file sizes is causing these failures.',
+                           1, 'Resolved by increasing memory allocation, implementing batch processing, and adding connection pooling.'),
+                          
+                          ('CAS04', 'Billing Statement Discrepancy', 2, 3, 2, 3,
+                           'Requestor has a discrepancy in his billing statement for the current month. Seeing charges for services that were supposedly terminated last month. Specifically questioning charges for 3 EC2 instances and 2 RDS databases that should have been deleted. Need detailed breakdown and assistance with potential refunds.',
+                           2, 'Billing team confirmed instances were not properly terminated. Provided refund for erroneous charges and helped properly terminate resources.'),
+                          
+                          ('CAS05', 'RDS Database Connection Failures', 1, 2, 3, 1,
+                           'Requestor: I am unable to establish a connection to my RDS database from my application servers. The connection was working fine until yesterday evening. Getting connection timeout errors and max connections exceeded messages. Application logs show intermittent connection failures affecting user transactions.',
+                           1, 'Issue identified as security group misconfiguration after maintenance window. Restored proper inbound rules.'),
+                          
+                          ('CAS06', 'New AWS Account Setup and Credentials', 3, 4, 4, 2,
+                           'Requestor: I have received the credentials for my new AWS account but I am unable to access the console. Keep getting invalid credentials error despite using the exact username and password provided. Need assistance with initial setup and access configuration. Also need guidance on best practices for account security.',
+                           3, 'Helped customer reset password and setup MFA. Provided account security best practices documentation.'),
+                          
+                          ('CAS07', 'VPC Configuration and Connectivity Issues', 4, 2, 1, 1,
+                           'Requestor: I am encountering issues with my VPC setup and connectivity between subnets. EC2 instances in private subnets cannot reach the internet through NAT Gateway. Also having issues with communication between resources in different availability zones. Need assistance with route table configuration and troubleshooting.',
+                           1, 'Configuration issues resolved by updating route tables and fixing NAT Gateway associations. All connectivity restored.'),
+                          
+                          ('CAS08', 'DNS Resolution Problems', 4, 2, 2, 3,
+                           'Requestor: I am experiencing issues with DNS resolution within my VPC. Applications cannot resolve domain names properly, causing service disruptions. Custom domain names are not working, and even AWS service endpoints are intermittently failing. Issue affects multiple applications across different subnets.',
+                           2, 'DNS resolution fixed by configuring VPC DNS settings and updating DHCP option sets properly.'),
+                          
+                          ('CAS09', 'SNS Notification Delivery Issues', 1, 1, 3, 2,
+                           'Requestor: I am not receiving notifications from my SNS topic despite having active subscriptions. Email notifications have stopped working for critical alerts from CloudWatch alarms. SMS notifications are also failing. This is impacting our incident response process and needs urgent attention.',
+                           1, 'SNS delivery issues resolved by updating subscription confirmations and fixing IAM permissions for SNS service.'),
+                          
+                          ('CAS10', 'S3 Bucket Access Permission Errors', 4, 4, 4, 1,
+                           'Requestor is getting Access Denied errors when trying to upload files to S3 bucket from application. The bucket policy was recently updated and now legitimate users cannot access their files. Need urgent assistance to restore access while maintaining security. Multiple users affected across different departments.',
+                           1, 'S3 bucket policy corrected to allow proper access while maintaining security. All user access restored successfully.')
+                      ]
+                      
+                      for case_data in cases_data:
+                          cur.execute("""
+                              INSERT INTO CaseSummarisation 
+                              (CaseID, Subject, ServiceNameID, CategoryTypeID, RequestorID, CaseOwnerID, CaseNotes, Priority, Feedback, CaseSummaryFlanT5) 
+                              VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) 
+                              ON CONFLICT (CaseID) DO NOTHING
+                          """, (*case_data, None))
+                      
+                      logger.info('Verifying data creation...')
+                      
+                      # Verify tables were created
+                      cur.execute("""
+                          SELECT table_name FROM information_schema.tables 
+                          WHERE table_schema = 'public' AND table_name IN (
+                              'servicenamedetails', 'categorytypedetails', 'requestordetails', 
+                              'caseownerdetails', 'promptshare', 'casesummarisation'
+                          ) ORDER BY table_name
+                      """)
+                      tables = cur.fetchall()
+                      logger.info(f"Created {len(tables)} tables: {[t[0] for t in tables]}")
+                      
+                      # Verify case count
+                      cur.execute("SELECT COUNT(*) FROM CaseSummarisation")
+                      case_count_result = cur.fetchone()
+                      case_count = case_count_result[0] if case_count_result else 0
+                      logger.info(f"Loaded {case_count} support cases")
+                      
+                      # Verify prompts
+                      cur.execute("SELECT COUNT(*) FROM PromptShare")
+                      prompt_count_result = cur.fetchone()
+                      prompt_count = prompt_count_result[0] if prompt_count_result else 0
+                      logger.info(f"Created {prompt_count} AI prompts")
+                  
+                  conn.close()
+                  logger.info('Text Summarization schema and data creation completed successfully')
+                  
+              except Exception as e:
+                  logger.error(f'Error creating Text Summarization schema: {str(e)}')
+                  raise e
+          
+          def lambda_handler(event, context):
+              logger.info('Starting Text Summarization lambda_handler')
+              print(f"Event: {event}")
+              
+              try:
+                  request_type = event.get('RequestType')
+                  
+                  if request_type == 'Create':
+                      logger.info('Handling Create request')
+                      create_text_summarization_schema(event, context)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": "Text Summarization schema and data created successfully"})
+                  elif request_type == 'Update':
+                      logger.info('Handling Update request')
+                      create_text_summarization_schema(event, context)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": "Text Summarization schema and data updated successfully"})
+                  elif request_type == 'Delete':
+                      logger.info('Handling Delete request')
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": "Delete completed - tables preserved"})
+                  else:
+                      logger.error(f"Invalid request type: {request_type}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": f"Invalid request type: {request_type}"})
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+  # Custom Resource to trigger the Lambda function
+  TextSummarizationBootstrapCustomResource:
+    Type: Custom::TextSummarizationBootstrap
+    DependsOn:
+      - TextSummarizationBootstrapFunction
+    Properties:
+      ServiceToken: !GetAtt TextSummarizationBootstrapFunction.Arn
+
+Outputs:
+  TextSummarizationBootstrapStatus:
+    Description: Status of Text Summarization data setup
+    Value: "Complete"
+    Export:
+      Name: !Sub "${AWS::Region}-${AWS::StackName}-TextSummarizationBootstrapStatus"
+
+  SupportCasesCount:
+    Description: Number of support cases loaded for text summarization
+    Value: "10"
+    Export:
+      Name: !Sub "${AWS::Region}-${AWS::StackName}-SupportCasesCount"
+
+  DatabaseTablesCreated:
+    Description: Database tables created for text summarization
+    Value: "ServiceNameDetails, CategoryTypeDetails, RequestorDetails, CaseOwnerDetails, PromptShare, CaseSummarisation"
+    Export:
+      Name: !Sub "${AWS::Region}-${AWS::StackName}-DatabaseTablesCreated"
