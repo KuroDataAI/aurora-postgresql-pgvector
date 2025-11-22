@@ -1,0 +1,204 @@
+
+Parameters:
+
+  TemplateName:
+    Type: String
+    Default: genai-idr-labs
+    Description: Name used for different elements created.
+
+  VPC:
+    Type: String
+
+  VpcCIDR:
+    Type: String
+
+  PrivateSubnets: 
+    Type: String
+
+  DBVersion:
+    Type: String
+
+  RDSVersionLambdaFunction:
+    Type: String
+    
+Resources:
+
+  roleEnhancedMonitoring:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Principal:
+              Service:
+                - monitoring.rds.amazonaws.com
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+  EncryptionKey:
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: 2012-10-17
+        Id: !Ref AWS::StackName
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Ref AWS::StackName
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}"
+      TargetKeyId: !Ref EncryptionKey
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "RDS DB Subnet Group"
+      SubnetIds: !Split [',', !Ref PrivateSubnets]
+
+  ## Create parameter groups for DB cluster
+  apgcustomclusterparamgroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: "Aurora PostgreSQL Custom Cluster parameter group"
+      Family: aurora-postgresql16
+      Parameters:
+        shared_preload_libraries: "pg_stat_statements"
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-clusterparamgroup"
+  
+  ## Create parameter groups for cluster nodes
+  apgcustomdbparamgroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: !Sub ${AWS::StackName}-dbparamgroup
+      Family: aurora-postgresql16
+      Parameters:
+        log_rotation_age: '1440'
+        log_rotation_size: '102400'
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-dbparamgroup
+
+  VPCSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: !Ref 'AWS::StackName'
+      SecurityGroupEgress:
+      - IpProtocol: -1
+        CidrIp: "0.0.0.0/0"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 5432
+        ToPort: 5432
+        CidrIp: !Ref VpcCIDR
+        Description: 'Access to AppServer Host Security Group'
+      VpcId: !Ref VPC
+      Tags:
+      - Key: Name
+        Value: !Sub '${AWS::StackName}-DBSecurityGroup'
+
+  RDSSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: "apgpg-pgvector-secret"
+      Description: 'This is the secret for Aurora cluster'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "postgres" }'
+        GenerateStringKey: 'password'
+        PasswordLength: 16
+        ExcludePunctuation: true
+
+  APGDBVersion:
+    Type: Custom::Variable
+    Properties:
+      ServiceToken: !Ref RDSVersionLambdaFunction
+      Engine: "aurora-postgresql"
+      EngineMajorVersion: !Ref DBVersion
+
+## Create Aurora cluster for vector
+  DBCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DBClusterIdentifier: "apgpg-pgvector"
+      Engine: aurora-postgresql
+      Port: 5432
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref RDSSecrets, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref RDSSecrets, ':SecretString:password}}' ]]
+      DBClusterParameterGroupName: !Ref apgcustomclusterparamgroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      AutoMinorVersionUpgrade: true
+      EngineVersion: !GetAtt APGDBVersion.EngineVersion
+      KmsKeyId: !Ref EncryptionKey
+      StorageEncrypted: true
+      StorageType: aurora-iopt1
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+      VpcSecurityGroupIds: [ !Ref VPCSecurityGroup ]
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 8
+        MaxCapacity: 16
+      EnableHttpEndpoint: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}"
+
+## Deploy the first cluster node (always the writer)
+  DBNodeWriter:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DBCluster
+      DBInstanceIdentifier: apgpg-pgvector-node-01
+      DBInstanceClass: "db.serverless"
+      DBParameterGroupName: !Ref apgcustomdbparamgroup
+      Engine: aurora-postgresql
+      MonitoringInterval: 1
+      MonitoringRoleArn: !GetAtt roleEnhancedMonitoring.Arn
+      PubliclyAccessible: false
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      AutoMinorVersionUpgrade: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-node-01
+
+  SecretPostgreSQLAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref RDSSecrets
+      TargetId: !Ref DBCluster
+      TargetType: AWS::RDS::DBCluster
+
+Outputs:
+  RDSSecrets:
+    Description: Secrets for Aurora PostgreSQL pgvector
+    Value: !Ref RDSSecrets
+    Export:
+      Name: !Sub "${AWS::Region}-${AWS::StackName}-RDSSecrets"
+
+  APGCluster:
+    Description: Aurora PostgreSQL pgvector cluster name
+    Value: !Ref DBCluster
+    Export:
+      Name: !Sub "${AWS::Region}-${AWS::StackName}-APGCluster"
+
+  APGClusterEP:
+    Description: Aurora PostgreSQL pgvector cluster name EP
+    Value: !GetAtt DBCluster.Endpoint.Address
+    Export:
+      Name: !Sub "${AWS::Region}-${AWS::StackName}-APGClusterEP"
